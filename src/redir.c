@@ -120,6 +120,19 @@ getdestaddr(int fd, struct sockaddr_storage *destaddr)
     return 0;
 }
 
+static int
+getsrcaddr(int fd, struct sockaddr_storage *srcaddr)
+{;
+    int error         = 0;
+    socklen_t socklen = sizeof(*srcaddr);
+    error = getpeername(fd, (struct sockaddr *)srcaddr, &socklen);
+
+    if (error) { // Didn't find a proper way to detect IP version.
+        return -1;
+    }
+    return 0;
+}
+
 int
 setnonblocking(int fd)
 {
@@ -242,7 +255,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
     if (!remote->send_ctx->connected) {
         if (!disable_sni) {
             // SNI
-            int ret       = 0;
+            /*int ret       = 0;
             uint16_t port = 0;
             if (AF_INET6 == server->destaddr.ss_family) { // IPv6
                 port = ntohs(((struct sockaddr_in6 *)&(server->destaddr))->sin6_port);
@@ -257,7 +270,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                                                  remote->buf->len, &server->hostname);
             if (ret > 0) {
                 server->hostname_len = ret;
-            }
+            }*/
         }
 
         ev_io_stop(EV_A_ & server_recv_ctx->io);
@@ -491,7 +504,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
                 abuf->len += server->hostname_len;
                 memcpy(abuf->data + abuf->len, &port, 2);
             } else if (AF_INET6 == server->destaddr.ss_family) { // IPv6
-                abuf->data[abuf->len++] = 4;          // Type 4 is IPv6 address
+                abuf->data[abuf->len++] = 6;          // Type 6 is IPv6 address, dst and source
 
                 size_t in6_addr_len = sizeof(struct in6_addr);
                 memcpy(abuf->data + abuf->len,
@@ -499,15 +512,29 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
                        in6_addr_len);
                 abuf->len += in6_addr_len;
                 memcpy(abuf->data + abuf->len,
+                       &(((struct sockaddr_in6 *)&(server->srcaddr))->sin6_addr),
+                       in6_addr_len);
+                abuf->len += in6_addr_len;
+                memcpy(abuf->data + abuf->len,
+                       &(((struct sockaddr_in6 *)&(server->srcaddr))->sin6_port),
+                       2);
+                abuf->len += 2;
+                memcpy(abuf->data + abuf->len,
                        &(((struct sockaddr_in6 *)&(server->destaddr))->sin6_port),
                        2);
             } else {                             // IPv4
-                abuf->data[abuf->len++] = 1; // Type 1 is IPv4 address
+                abuf->data[abuf->len++] = 5; // Type 5 is IPv4 addresses, dst and source
 
                 size_t in_addr_len = sizeof(struct in_addr);
                 memcpy(abuf->data + abuf->len,
                        &((struct sockaddr_in *)&(server->destaddr))->sin_addr, in_addr_len);
                 abuf->len += in_addr_len;
+                memcpy(abuf->data + abuf->len,
+                       &((struct sockaddr_in *)&(server->srcaddr))->sin_addr, in_addr_len);
+                abuf->len += in_addr_len;
+                memcpy(abuf->data + abuf->len,
+                       &((struct sockaddr_in *)&(server->srcaddr))->sin_port, 2);
+                abuf->len += 2;
                 memcpy(abuf->data + abuf->len,
                        &((struct sockaddr_in *)&(server->destaddr))->sin_port, 2);
             }
@@ -740,7 +767,9 @@ accept_cb(EV_P_ ev_io *w, int revents)
 {
     listen_ctx_t *listener = (listen_ctx_t *)w;
     struct sockaddr_storage destaddr;
+    struct sockaddr_storage srcaddr;
     memset(&destaddr, 0, sizeof(struct sockaddr_storage));
+    memset(&srcaddr, 0, sizeof(struct sockaddr_storage));
 
     int err;
 
@@ -753,6 +782,12 @@ accept_cb(EV_P_ ev_io *w, int revents)
     err = getdestaddr(serverfd, &destaddr);
     if (err) {
         ERROR("getdestaddr");
+        return;
+    }
+
+    err = getsrcaddr(serverfd, &srcaddr);
+    if (err) {
+        ERROR("getsrcaddr");
         return;
     }
 
@@ -822,6 +857,7 @@ accept_cb(EV_P_ ev_io *w, int revents)
     server->remote   = remote;
     remote->server   = server;
     server->destaddr = destaddr;
+    server->srcaddr = srcaddr;
 
     if (fast_open) {
         // save remote addr for fast open

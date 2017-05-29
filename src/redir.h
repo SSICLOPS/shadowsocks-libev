@@ -62,6 +62,7 @@ typedef struct server {
     size_t hostname_len;
 
     struct sockaddr_storage destaddr;
+    struct sockaddr_storage srcaddr;
     ev_timer delayed_connect_watcher;
 } server_t;
 

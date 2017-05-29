@@ -102,7 +102,7 @@ static void block_list_clear_cb(EV_P_ ev_timer *watcher, int revents);
 static remote_t *new_remote(int fd);
 static server_t *new_server(int fd, listen_ctx_t *listener);
 static remote_t *connect_to_remote(EV_P_ struct addrinfo *res,
-                                   server_t *server);
+                                   server_t *server, char *destaddr, uint16_t destport, char *srcaddr, uint16_t srcport);
 
 static void free_remote(remote_t *remote);
 static void close_and_free_remote(EV_P_ remote_t *remote);
@@ -251,6 +251,27 @@ get_peer_name(int fd)
         return NULL;
     }
     return peer_name;
+}
+
+int
+bind_to_port(int socket_fd, int version)
+{
+    struct sockaddr_storage storage;
+	memset(&storage, 0, sizeof(struct sockaddr_storage));
+	if (version == 4) {
+		struct sockaddr_in *addr = (struct sockaddr_in *)&storage;
+		addr->sin_addr.s_addr = INADDR_ANY;
+		addr->sin_family = AF_INET;
+		addr->sin_port = 0;
+		return bind(socket_fd, (struct sockaddr *)addr, sizeof(struct sockaddr_in));
+	} else if (version == 6) {
+		struct sockaddr_in6 *addr = (struct sockaddr_in6 *)&storage;
+		addr->sin6_addr = in6addr_any;
+		addr->sin6_family = AF_INET6;
+		addr->sin6_port = 0;
+		return bind(socket_fd, (struct sockaddr *)addr, sizeof(struct sockaddr_in6));
+	}
+    return -1;
 }
 
 #ifdef __linux__
@@ -441,12 +462,18 @@ create_and_bind(const char *host, const char *port, int mptcp)
 
 static remote_t *
 connect_to_remote(EV_P_ struct addrinfo *res,
-                  server_t *server)
+                  server_t *server, char *destaddr, uint16_t destport, char *srcaddr, uint16_t srcport)
 {
     int sockfd;
 #ifdef SET_INTERFACE
     const char *iface = server->listen_ctx->iface;
 #endif
+    socklen_t local_addr_size = sizeof(struct sockaddr_storage);
+	struct sockaddr_storage localstorage;
+	memset(&localstorage, 0, sizeof(struct sockaddr_storage));
+	char command[150] = {0};
+	int sysret = 0;
+
 
     if (acl) {
         char ipstr[INET6_ADDRSTRLEN];
@@ -504,6 +531,39 @@ connect_to_remote(EV_P_ struct addrinfo *res,
     }
 #endif
 
+    if (((struct sockaddr_storage *)res->ai_addr)->ss_family == AF_INET){
+               bind_to_port(sockfd, 4);
+       }
+       else if (((struct sockaddr_storage *)res->ai_addr)->ss_family == AF_INET6){
+               bind_to_port(sockfd, 6);
+       }
+       getsockname(sockfd, (struct sockaddr *)&localstorage, &local_addr_size);
+       if (((struct sockaddr_storage *)res->ai_addr)->ss_family == AF_INET){
+        if (verbose) {
+            LOGI("connect from %d", ntohs(((struct sockaddr_in *)&(localstorage))->sin_port) );
+        }
+
+        sprintf(command, "/sbin/iptables -t nat -I POSTROUTING -d %s -p tcp --dport %d --sport %d -j SNAT --to %s:%d", destaddr, (int)destport, (int)ntohs(((struct sockaddr_in *)&(localstorage))->sin_port), srcaddr, (int)srcport);
+        sysret = system(command);
+        if ( sysret == -1) {
+            ERROR("setiptables");
+            close(sockfd);
+            return NULL;
+        }
+    }
+    else if (((struct sockaddr_storage *)res->ai_addr)->ss_family == AF_INET6){
+        if (verbose) {
+            LOGI("connect from %d", ntohs(((struct sockaddr_in6 *)&(localstorage))->sin6_port) );
+        }
+
+        sprintf(command, "/sbin/ip6tables -t nat -I POSTROUTING -d %s -p tcp --dport %d --sport %d -j SNAT --to %s:%d", destaddr, (int)destport, (int)ntohs(((struct sockaddr_in6 *)&(localstorage))->sin6_port), srcaddr, (int)srcport);
+        sysret = system(command);
+        if ( sysret == -1) {
+            ERROR("setip6tables");
+            close(sockfd);
+            return NULL;
+        }
+    }
     remote_t *remote = new_remote(sockfd);
 
 #ifdef TCP_FASTOPEN
@@ -744,11 +804,17 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         int need_query = 0;
         char atyp      = server->buf->data[offset++];
         char host[257] = { 0 };
+        char srchost[257] = { 0 };
         uint16_t port  = 0;
+        uint16_t srcport = 0;
         struct addrinfo info;
         struct sockaddr_storage storage;
+        struct sockaddr_storage srcstorage;
+        struct sockaddr_storage localstorage;
         memset(&info, 0, sizeof(struct addrinfo));
         memset(&storage, 0, sizeof(struct sockaddr_storage));
+        memset(&srcstorage, 0, sizeof(struct sockaddr_storage));
+        memset(&localstorage, 0, sizeof(struct sockaddr_storage));
 
         // get remote addr and port
         if ((atyp & ADDRTYPE_MASK) == 1) {
@@ -761,6 +827,35 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                 dns_ntop(AF_INET, (const void *)(server->buf->data + offset),
                          host, INET_ADDRSTRLEN);
                 offset += in_addr_len;
+            } else {
+                report_addr(server->fd, MALFORMED, "invalid length for ipv4 address");
+                close_and_free_server(EV_A_ server);
+                return;
+            }
+            addr->sin_port   = *(uint16_t *)(server->buf->data + offset);
+            info.ai_family   = AF_INET;
+            info.ai_socktype = SOCK_STREAM;
+            info.ai_protocol = IPPROTO_TCP;
+            info.ai_addrlen  = sizeof(struct sockaddr_in);
+            info.ai_addr     = (struct sockaddr *)addr;
+        } else if ((atyp & ADDRTYPE_MASK) == 5) {
+            // IP V4 destination and source
+            struct sockaddr_in *addr = (struct sockaddr_in *)&storage;
+            size_t in_addr_len       = sizeof(struct in_addr);
+            addr->sin_family = AF_INET;
+            struct sockaddr_in *srcaddr = (struct sockaddr_in *)&srcstorage;
+            srcaddr->sin_family = AF_INET;
+            if (server->buf->len >= 2*in_addr_len + 3) {
+                addr->sin_addr = *(struct in_addr *)(server->buf->data + offset);
+                dns_ntop(AF_INET, (const void *)(server->buf->data + offset),
+                         host, INET_ADDRSTRLEN);
+                offset += in_addr_len;
+                srcaddr->sin_addr = *(struct in_addr *)(server->buf->data + offset);
+                dns_ntop(AF_INET, (const void *)(server->buf->data + offset),
+                         srchost, INET_ADDRSTRLEN);
+                offset += in_addr_len;
+                srcport = *(uint16_t *)(server->buf->data + offset);
+                offset += 2;
             } else {
                 report_addr(server->fd, MALFORMED, "invalid length for ipv4 address");
                 close_and_free_server(EV_A_ server);
@@ -828,6 +923,36 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                 dns_ntop(AF_INET6, (const void *)(server->buf->data + offset),
                          host, INET6_ADDRSTRLEN);
                 offset += in6_addr_len;
+            } else {
+                LOGE("invalid header with addr type %d", atyp);
+                report_addr(server->fd, MALFORMED, "invalid length for ipv6 address");
+                close_and_free_server(EV_A_ server);
+                return;
+            }
+            addr->sin6_port  = *(uint16_t *)(server->buf->data + offset);
+            info.ai_family   = AF_INET6;
+            info.ai_socktype = SOCK_STREAM;
+            info.ai_protocol = IPPROTO_TCP;
+            info.ai_addrlen  = sizeof(struct sockaddr_in6);
+            info.ai_addr     = (struct sockaddr *)addr;
+        } else if ((atyp & ADDRTYPE_MASK) == 6) {
+            // IP V6
+            struct sockaddr_in6 *addr = (struct sockaddr_in6 *)&storage;
+            size_t in6_addr_len       = sizeof(struct in6_addr);
+            addr->sin6_family = AF_INET6;
+            struct sockaddr_in6 *srcaddr = (struct sockaddr_in6 *)&srcstorage;
+            srcaddr->sin6_family = AF_INET6;
+            if (server->buf->len >= 2*in6_addr_len + 5) {
+                addr->sin6_addr = *(struct in6_addr *)(server->buf->data + offset);
+                dns_ntop(AF_INET6, (const void *)(server->buf->data + offset),
+                         host, INET6_ADDRSTRLEN);
+                offset += in6_addr_len;
+                srcaddr->sin6_addr = *(struct in6_addr *)(server->buf->data + offset);
+                dns_ntop(AF_INET6, (const void *)(server->buf->data + offset),
+                         srchost, INET6_ADDRSTRLEN);
+                offset += in6_addr_len;
+                srcport = *(uint16_t *)(server->buf->data + offset);
+                               offset += 2;
             } else {
                 LOGE("invalid header with addr type %d", atyp);
                 report_addr(server->fd, MALFORMED, "invalid length for ipv6 address");
