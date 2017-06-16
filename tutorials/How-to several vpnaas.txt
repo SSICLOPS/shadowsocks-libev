@@ -1,0 +1,25 @@
+Assuming Cloud 1 local cloud, cloud 2 and cloud 3 remote clouds. 
+Assuming network 1a and 1b local virtual networks on cloud 1 connected to router1 with public IP 1.1.1.1, IP in 1a 1.1.11.1 and in 1b 1.1.12.1
+Assuming network 2a local virtual network on cloud 2 connected to router2 with public IP 2.2.2.1, IP in 2a 2.2.21.1
+Assuming network 3a local virtual network on cloud 3 connected to router3 with public IP 3.3.3.1, IP in 3a 3.3.31.1
+Assuming existing IKE policy ikepolicy on all clouds, IPSec policy ipsecpolicy on all clouds
+Assuming we want to connect 1a to 2a and 1b to 3a with VPNaaS
+
+on cloud 2 and 3, set up the VPN through the web interface normally.
+On cloud 1, do not create the VPN service and the connections through the web interface. Instead :
+
+
+sudo su
+cd
+source openrc
+#create the service without any subnet attached (does not work through Horizon)
+neutron vpn-service-create --name serv1 --description "VPNaaS" router1
+#create the groups of subnet to connect, the --value option can be repeated to connect several networks / subnets through the same tunnel
+neutron vpn-endpoint-group-create --name 1a --type subnet --value <1a subnet ID>
+neutron vpn-endpoint-group-create --name 1b --type subnet --value <1b subnet ID>
+#create the group of subnets (peers) to connect, the --value option can be repeated also
+neutron vpn-endpoint-group-create --name 2a --type cidr --value 2.2.21.0/24
+neutron vpn-endpoint-group-create --name 3a --type cidr --value 3.3.31.0/24
+#create the connections
+neutron ipsec-site-connection-create --name 2a --vpnservice-id serv1    --ikepolicy-id ikepolicy --ipsecpolicy-id ipsecpolicy --peer-address 2.2.2.1    --peer-id 2.2.2.1 --local-ep-group 1a --peer-ep-group 2a --psk testPSK
+neutron ipsec-site-connection-create --name 3a --vpnservice-id serv1    --ikepolicy-id ikepolicy --ipsecpolicy-id ipsecpolicy --peer-address 3.3.3.3.1    --peer-id 3.3.3.1 --local-ep-group 1b --peer-ep-group 3a --psk testPSK

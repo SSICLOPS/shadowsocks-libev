@@ -1,0 +1,511 @@
+how to add the MPTCP proxy
+
+## General idea
+
+get the mptcp.zip, unzip it. Copy and modify the qemu-if(up|down) to adapt to as many adapters you need. add execute rights to the scripts, modify the command line in the text file to start the machine. Create a linux bridge br-proxy.
+once the vm is started, change the Mac address to a random one, and sysctl -w net.ipv4.conf.eth0.arp_accept=1 and for all the other interfaces + default and all and lo
+plug one interface of the proxy into br-cloud, by setting qemu-if(up|down) correctly, the other in br-proxy.Provision as many /20 networks as you have uplinks. Give the first IP address of each network to the host on br-proxy. 
+For each proxy started, give an address in each of the uplink networks. Set the proxy up following the how-to. Set a rule to DNAT traffic to the server port to the server IP depending on the uplink it comes from, and SNAT the traffic from those subnets into the correct uplink address. On br-cloud, add a rule to divert the TCP traffic from the cloud to the proxy and forward the traffic from the proxy to the cloud.
+Several instances of ss-redir and ss-server will run on the proxy VM, one per peer cloud. The selection will happen with the REDIRECT target of iptables, based on the destination IP. One rule per IP address is needed.
+
+
+Run the proxy : 
+change MAC address and net.ipv4.conf.XXXX.arp_accept
+
+cat > config.json.redirect <<EOF 
+
+{ 
+"server":"192.168.10.3", 
+"server_port":"1081", 
+"local_port":"1080", 
+"local_address":"0.0.0.0", 
+"password":"jenga!", 
+"timeout":60, 
+"method":"table" 
+} EOF 
+cat > config.json.server <<EOF 
+{ 
+"server":"192.168.10.2", 
+"server_port":"1081", 
+"local_port":"1080", 
+"password":"jenga!", 
+"timeout":60, 
+"method":"table" 
+} EOF
+this is from my notes
+and setting up ipconfig and iptables:
+sudo ifconfig eth0 10.1.0.100 netmask 255.255.255.0 up 
+sudo ip route add default via 10.1.0.1 
+sudo ip addr add 30.0.1.10/24 dev eth0 
+sudo sysctl -w net.ipv4.conf.all.forwarding=1 
+sudo sysctl -w net.ipv4.tcp_congestion_control=lia 
+sudo iptables -t nat -N SHADOWSOCKS  
+sudo iptables -t nat -A SHADOWSOCKS -p tcp -j REDIRECT --to-ports 1080
+sudo iptables -t nat -A PREROUTING -s 10.1.0.0/24 -d 10.2.0.0/24 -j SHADOWSOCKS
+
+/opt/shadowsocks/ss-server -c config.json.server & 
+/opt/shadowsocks/ss-redir -c config.json.redirect &
+
+
+
+
+
+
+
+## Setup in Aalto 1 for NEC
+
+brctl addbr br-proxy-125
+brctl addbr br-proxy-127
+ip l s dev br-proxy-125 up
+ip l s dev br-proxy-127 up
+ip a a dev br-proxy-125 192.168.0.1/20
+ip a a dev br-proxy-127 192.168.16.1/20
+ip rule add from 192.168.0.0/20 lookup public-125
+ip rule add from 192.168.16.0/20 lookup public-127
+ip r a 192.168.0.0/20 dev br-proxy-125  proto kernel  scope link  src 192.168.0.1 table public-125
+ip r a 192.168.16.0/20 dev br-proxy-127  proto kernel  scope link  src 192.168.16.1 table public-127
+iptables -t nat -I POSTROUTING -s 192.168.0.0/20 -o br-ex-pub -j MASQUERADE
+iptables -t nat -I POSTROUTING -s 192.168.16.0/20 -o br-ex-127 -j MASQUERADE
+iptables -t nat -I PREROUTING -d 195.148.125.33 -p tcp --dport 1081 -j DNAT --to-destination 192.168.0.2
+iptables -t nat -I PREROUTING -d 195.148.127.236 -p tcp --dport 1081 -j DNAT --to-destination 192.168.16.2
+iptables -t nat -I PREROUTING -d 195.148.125.33 -p tcp --dport 1082 -j DNAT --to-destination 192.168.0.3
+iptables -t nat -I PREROUTING -d 195.148.127.236 -p tcp --dport 1082 -j DNAT --to-destination 192.168.16.3
+
+ovs-vsctl add-br br-mptcp-cloud
+ovs-vsctl add-port br-mptcp-cloud mptcp-br-cloud -- set interface mptcp-br-cloud type=patch options=peer=cloud-br-mptcp
+ovs-vsctl add-port br-cloud cloud-br-mptcp -- set interface cloud-br-mptcp type=patch options=peer=mptcp-br-cloud
+
+kvm -smp 1 -m 192 -kernel bzImage-mptcp -initrd core-mptcp.gz -nographic -device virtio-net,netdev=mynet -netdev tap,id=mynet,script=qemu-ifup-br-cloud,downscript=qemu-ifdown-br-cloud -device virtio-net,netdev=mynet2 -netdev tap,id=mynet2,script=qemu-ifup-br-proxy-125,downscript=qemu-ifdown-br-proxy-125 -device virtio-net,netdev=mynet3 -netdev tap,id=mynet3,script=qemu-ifup-br-proxy-127,downscript=qemu-ifdown-br-proxy-127 -append console=ttyS0
+# Run in the VM
+#> sysctl -w net.ipv4.conf.eth0.arp_accept=1
+#> sysctl -w net.ipv4.conf.eth1.arp_accept=1
+#> sysctl -w net.ipv4.conf.eth2.arp_accept=1
+#> ip a a dev eth0 10.4.0.253/24
+#> ip a a dev eth1 192.168.0.2/20
+#> ip a a dev eth2 192.168.16.2/20
+#> mkdir /etc/iproute2
+#> echo "200    public-125" >> /etc/iproute2/rt_tables
+#> echo "201    public-127" >> /etc/iproute2/rt_tables
+#> ip rule add from 192.168.16.2 lookup public-127
+#> ip rule add from 192.168.0.2 lookup public-125
+#> ip r a 192.168.0.0/20 dev eth1  proto kernel  scope link  src 192.168.0.2 table public-125
+#> ip r a 192.168.16.0/20 dev eth2  proto kernel  scope link  src 192.168.16.2 table public-127
+#> ip r a default via 192.168.0.1 table public-125
+#> ip r a default via 192.168.16.1 table public-127
+#> ip r a default via 192.168.0.1
+#> echo "{ 
+#> \"server\":\"195.37.154.43\", 
+#> \"server_port\":\"1081\", 
+#> \"local_port\":\"1080\", 
+#> \"local_address\":\"0.0.0.0\", 
+#> \"password\":\"jenga!\", 
+#> \"timeout\":60, 
+#> \"method\":\"table\" 
+#> }" > config.json.redirect
+#> echo "{ 
+#> \"server\":\"128.141.232.250\", 
+#> \"server_port\":\"1081\", 
+#> \"local_port\":\"1082\", 
+#> \"local_address\":\"0.0.0.0\", 
+#> \"password\":\"jenga!\", 
+#> \"timeout\":60, 
+#> \"method\":\"table\" 
+#> }" > config.json.redirect.CERN
+#> echo "{ 
+#> \"server\":\"192.168.0.2\", 
+#> \"server_port\":\"1081\", 
+#> \"local_port\":\"1080\", 
+#> \"local_address\":\"0.0.0.0\", 
+#> \"password\":\"jenga!\", 
+#> \"timeout\":60, 
+#> \"method\":\"table\" 
+#> }" > config.json.server
+#> sudo sysctl -w net.ipv4.conf.all.forwarding=1 
+#> sudo sysctl -w net.ipv4.tcp_congestion_control=lia 
+#> sudo iptables -t nat -N SHADOWSOCKS  
+#> sudo iptables -t nat -A SHADOWSOCKS -d 10.4.0.5 -p tcp -j REDIRECT --to-ports 1080
+#> sudo iptables -t nat -A PREROUTING -s 10.4.0.0/24 -d 10.4.0.0/24 -j SHADOWSOCKS
+#> ip l a dev veth0 type veth peer name veth1
+#> ip l s dev veth0 up
+#> ip l s dev veth1 up
+#> ip a a dev veth0 195.148.125.33/24
+#> ip a a dev veth1 195.148.127.236/24
+#> ip r d 195.148.125.0/24
+#> ip r d 195.148.127.0/24
+#> ip r d local 195.148.125.33 table local
+#> ip r d local 195.148.127.236 table local
+#> ip r d broadcast 195.148.125.0 table local
+#> ip r d broadcast 195.148.127.0 table local
+#> ip r d broadcast 195.148.125.255 table local
+#> ip r d broadcast 195.148.127.255 table local
+#> ip r a 195.37.154.43 via 192.168.0.1 mtu 1458
+#> ip r a 195.37.154.43 via 192.168.0.1 mtu 1458 table public-125
+#> ip r a 195.37.154.43 via 192.168.16.1 mtu 1458 table public-127
+
+
+ovs-ofctl add-flow br-cloud table=0,priority=4,in_port=9,tcp,actions=mod_vlan_vid:4,mod_dl_dst:52:54:00:12:34:56,output:17
+ovs-ofctl add-flow br-cloud table=0,priority=4,in_port=9,dl_dst=52:54:00:12:34:56,actions=mod_vlan_vid:4,output:17
+ovs-ofctl add-flow br-cloud "table=0,priority=4,in_port=9,dl_dst=ff:ff:ff:ff:ff:ff,actions=mod_vlan_vid:4,output:17,resubmit(,2)"
+ovs-ofctl add-flow br-cloud table=0,priority=4,in_port=17,dl_vlan=4,actions=strip_vlan,output:9
+
+#ovs-ofctl del-flows br-cloud --strict table=0,priority=4,in_port=9,tcp
+
+
+
+## Setup in Aalto 1 for CERN
+
+kvm -smp 1 -m 192 -kernel bzImage-mptcp -initrd core-mptcp.gz -nographic -device virtio-net,netdev=mynet -netdev tap,id=mynet,script=qemu-ifup-br-cloud,downscript=qemu-ifdown-br-cloud -device virtio-net,netdev=mynet2 -netdev tap,id=mynet2,script=qemu-ifup-br-proxy-125,downscript=qemu-ifdown-br-proxy-125 -device virtio-net,netdev=mynet3 -netdev tap,id=mynet3,script=qemu-ifup-br-proxy-127,downscript=qemu-ifdown-br-proxy-127 -append console=ttyS0
+# Run in the VM
+#> sysctl -w net.ipv4.conf.eth0.arp_accept=1
+#> sysctl -w net.ipv4.conf.eth1.arp_accept=1
+#> sysctl -w net.ipv4.conf.eth2.arp_accept=1
+#> ip a a dev eth0 10.5.1.3/24
+#> ip a a dev eth1 192.168.0.3/24
+#> ip a a dev eth2 192.168.16.3/20
+#> mkdir /etc/iproute2
+#> echo "200    public-125" >> /etc/iproute2/rt_tables
+#> echo "201    public-127" >> /etc/iproute2/rt_tables
+#> ip rule add from 192.168.16.3 lookup public-127
+#> ip rule add from 192.168.0.3 lookup public-125
+#> ip r a 192.168.0.0/24 dev eth1  proto kernel  scope link  src 192.168.0.3 table public-125
+#> ip r a 192.168.16.0/20 dev eth2  proto kernel  scope link  src 192.168.16.3 table public-127
+#> ip r a default via 192.168.0.1 table public-125
+#> ip r a default via 192.168.16.1 table public-127
+#> ip r a default via 192.168.0.1
+#> echo "{ 
+#> \"server\":\"195.37.154.43\", 
+#> \"server_port\":\"1081\", 
+#> \"local_port\":\"1081\", 
+#> \"local_address\":\"0.0.0.0\", 
+#> \"password\":\"jenga!\", 
+#> \"timeout\":60, 
+#> \"method\":\"table\" 
+#> }" > config.json.redirect.NEC
+#> echo "{ 
+#> \"server\":\"128.141.232.250\", 
+#> \"server_port\":\"1081\", 
+#> \"local_port\":\"1080\", 
+#> \"local_address\":\"0.0.0.0\", 
+#> \"password\":\"jenga!\", 
+#> \"timeout\":60, 
+#> \"method\":\"table\" 
+#> }" > config.json.redirect
+#> echo "{ 
+#> \"server\":\"192.168.0.3\", 
+#> \"server_port\":\"1082\", 
+#> \"local_port\":\"1080\", 
+#> \"local_address\":\"0.0.0.0\", 
+#> \"password\":\"jenga!\", 
+#> \"timeout\":60, 
+#> \"method\":\"table\" 
+#> }" > config.json.server
+#> sudo sysctl -w net.ipv4.conf.all.forwarding=1 
+#> sudo sysctl -w net.ipv4.tcp_congestion_control=lia 
+#> sudo iptables -t nat -N SHADOWSOCKS  
+#> sudo iptables -t nat -A SHADOWSOCKS -d 10.5.0.0/24 -p tcp -j REDIRECT --to-ports 1080
+#> sudo iptables -t nat -A SHADOWSOCKS -d 10.5.4.0/24 -p tcp -j REDIRECT --to-ports 1081
+#> sudo iptables -t nat -A PREROUTING -s 10.5.1.0/24 -d 10.5.4.0/24 -j SHADOWSOCKS
+#> sudo iptables -t nat -A PREROUTING -s 10.5.1.0/24 -d 10.5.0.0/24 -j SHADOWSOCKS
+#> ip l a dev veth0 type veth peer name veth1
+#> ip l s dev veth0 up
+#> ip l s dev veth1 up
+#> ip a a dev veth0 195.148.125.33/24
+#> ip a a dev veth1 195.148.127.236/24
+#> ip r d 195.148.125.0/24
+#> ip r d 195.148.127.0/24
+#> ip r d local 195.148.125.33 table local
+#> ip r d local 195.148.127.236 table local
+#> ip r d broadcast 195.148.125.0 table local
+#> ip r d broadcast 195.148.127.0 table local
+#> ip r d broadcast 195.148.125.255 table local
+#> ip r d broadcast 195.148.127.255 table local
+#> ip r a 192.168.2.32 via 192.168.0.1 mtu 1458
+#> ip r a 192.168.2.32 via 192.168.0.1 mtu 1458 table public-125
+#> ip r a 192.168.2.32 via 192.168.16.1 mtu 1458 table public-127
+
+
+ovs-ofctl add-flow br-cloud table=0,priority=4,in_port=15,tcp,actions=mod_vlan_vid:5,mod_dl_dst:52:54:00:12:34:56,output:17
+ovs-ofctl add-flow br-cloud table=0,priority=4,in_port=15,dl_dst=52:54:00:12:34:56,actions=mod_vlan_vid:5,output:17
+ovs-ofctl add-flow br-cloud "table=0,priority=4,in_port=15,dl_dst=ff:ff:ff:ff:ff:ff,actions=mod_vlan_vid:5,output:17,resubmit(,2)"
+ovs-ofctl add-flow br-cloud table=0,priority=4,in_port=17,dl_vlan=5,actions=strip_vlan,output:15
+
+#ovs-ofctl del-flows br-cloud --strict table=0,priority=4,in_port=15,tcp
+
+
+## NEC 
+
+brctl addbr br-proxy-154
+ip l s dev br-proxy-154 up
+ip a a dev br-proxy-154 192.168.32.1/20
+#ip rule add from 192.168.32.0/20 lookup public-154
+#ip r a 192.168.32.0/20 dev br-proxy-154  proto kernel  scope link  src 192.168.32.1 table public-154
+brctl addbr br-proxy-110
+ip l s dev br-proxy-110 up
+ip a a dev br-proxy-110 192.168.16.1/20
+#ip rule add from 192.168.16.0/20 lookup public-110
+#ip r a 192.168.16.0/20 dev br-proxy-110  proto kernel  scope link  src 192.168.16.1 table public-110
+iptables -t nat -I POSTROUTING -s 192.168.32.0/20 -o br-ex-public -j MASQUERADE
+iptables -t nat -I PREROUTING -d 195.37.154.43 -p tcp --dport 1081 -j DNAT --to-destination 192.168.32.2
+iptables -t nat -I PREROUTING -d 195.37.154.43 -p tcp --dport 1082 -j DNAT --to-destination 192.168.32.3
+
+iptables -t nat -I POSTROUTING -s 192.168.16.0/20 -o enx082e5f290e69 -j MASQUERADE
+iptables -t nat -I PREROUTING -d 192.168.110.9 -p tcp --dport 1081 -j DNAT --to-destination 192.168.16.2
+iptables -t nat -I PREROUTING -d 192.168.110.9 -p tcp --dport 1082 -j DNAT --to-destination 192.168.16.3
+
+ovs-vsctl add-br br-mptcp-cloud
+ovs-vsctl add-port br-mptcp-cloud mptcp-br-cloud -- set interface mptcp-br-cloud type=patch options=peer=cloud-br-mptcp
+ovs-vsctl add-port br-cloud cloud-br-mptcp -- set interface cloud-br-mptcp type=patch options=peer=mptcp-br-cloud
+
+
+
+kvm -smp 1 -m 192 -kernel bzImage-mptcp -initrd core-mptcp.gz -nographic -device virtio-net,netdev=mynet -netdev tap,id=mynet,script=qemu-ifup-br-mptcp-cloud,downscript=qemu-ifdown-br-mptcp-cloud -device virtio-net,netdev=mynet2 -netdev tap,id=mynet2,script=qemu-ifup-br-proxy-154,downscript=qemu-ifdown-br-proxy-154 -append console=ttyS0
+# Run in VM
+#> sysctl -w net.ipv4.conf.eth0.arp_accept=1
+#> sysctl -w net.ipv4.conf.eth1.arp_accept=1
+#> sysctl -w net.ipv4.conf.eth2.arp_accept=1
+#> ip a a dev eth1 192.168.32.2/20
+#> ip a a dev eth0 10.4.0.252/24
+#> ip a a dev eth2 192.168.16.2/20
+#> mkdir /etc/iproute2
+#> echo "200    public-125" >> /etc/iproute2/rt_tables
+#> echo "201    public-110" >> /etc/iproute2/rt_tables
+#>
+#> ip rule add from 192.168.32.2 lookup public-125
+#> ip r a 192.168.32.0/20 dev eth1  proto kernel  scope link  src 192.168.32.2 table public-125
+#>
+#> ip rule add from 192.168.16.2 lookup public-110
+#> ip r a 192.168.16.0/20 dev eth2  proto kernel  scope link  src 192.168.16.2 table public-110
+#>
+#> ip r a default via 192.168.32.1 table public-125
+#> ip r a default via 192.168.16.1 table public-110
+#> ip r a default via 192.168.32.1
+#>
+#> echo "{ 
+#> \"server\":\"195.148.125.33\", 
+#> \"server_port\":\"1081\", 
+#> \"local_port\":\"1080\", 
+#> \"local_address\":\"0.0.0.0\", 
+#> \"password\":\"jenga!\", 
+#> \"timeout\":60, 
+#> \"method\":\"table\" 
+#> }" > config.json.redirect
+#> echo "{ 
+#> \"server\":\"192.168.32.2\", 
+#> \"server_port\":\"1081\", 
+#> \"local_port\":\"1080\", 
+#> \"local_address\":\"0.0.0.0\", 
+#> \"password\":\"jenga!\", 
+#> \"timeout\":60, 
+#> \"method\":\"table\" 
+#> }" > config.json.server
+#> sudo sysctl -w net.ipv4.conf.all.forwarding=1 
+#> sudo sysctl -w net.ipv4.tcp_congestion_control=lia 
+#> sudo iptables -t nat -N SHADOWSOCKS  
+#> sudo iptables -t nat -A SHADOWSOCKS -d 10.4.0.134 -p tcp -j REDIRECT --to-ports 1080
+#> sudo iptables -t nat -A PREROUTING -s 10.4.0.0/24 -d 10.4.0.0/24 -j SHADOWSOCKS
+#>
+#> ip l a dev veth0 type veth peer name veth1
+#> ip l s dev veth0 up
+#> ip l s dev veth1 up
+#> ip a a dev veth0 195.37.154.43/24
+#> ip a a dev veth1 192.168.110.9/24
+#> ip r d 195.37.154.0/24
+#> ip r d 192.168.110.0/24
+#> ip r d local 195.37.154.43 table local
+#> ip r d local 192.168.110.9 table local
+#> ip r d broadcast 195.37.154.0 table local
+#> ip r d broadcast 192.168.110.0 table local
+#> ip r d broadcast 195.37.154.255 table local
+#> ip r d broadcast 192.168.110.255 table local
+
+
+
+kvm -smp 4 -m 512 -kernel bzImage-mptcp -initrd core-mptcp.gz -nographic -device virtio-net,netdev=mynet -netdev tap,id=mynet,script=qemu-ifup-br-mptcp-cloud,downscript=qemu-ifdown-br-mptcp-cloud -device virtio-net,netdev=mynet2 -netdev tap,id=mynet2,script=qemu-ifup-br-proxy-154,downscript=qemu-ifdown-br-proxy-154 -device virtio-net,netdev=mynet3 -netdev tap,id=mynet3,script=qemu-ifup-br-proxy-110,downscript=qemu-ifdown-br-proxy-110 -append console=ttyS0
+# Run in VM
+#> sysctl -w net.ipv4.conf.eth0.arp_accept=1
+#> sysctl -w net.ipv4.conf.eth1.arp_accept=1
+#> sysctl -w net.ipv4.conf.eth2.arp_accept=1
+#> ip a a dev eth1 192.168.32.3/20
+#> ip a a dev eth0 10.5.4.3/24
+#> ip a a dev eth2 192.168.16.3/20
+#> mkdir /etc/iproute2
+#> echo "200    public-125" >> /etc/iproute2/rt_tables
+#> echo "201    public-110" >> /etc/iproute2/rt_tables
+#>
+#> ip rule add from 192.168.32.3 lookup public-125
+#> ip r a 192.168.32.0/20 dev eth1  proto kernel  scope link  src 192.168.32.3 table public-125
+#>
+#> ip rule add from 192.168.16.3 lookup public-110
+#> ip r a 192.168.16.0/20 dev eth2  proto kernel  scope link  src 192.168.16.3 table public-110
+#>
+#> ip r a default via 192.168.32.1 table public-125
+#> ip r a default via 192.168.16.1 table public-110
+#> ip r a default via 192.168.32.1
+#>
+#> echo "{ 
+#> \"server\":\"192.168.2.32\", 
+#> \"server_port\":\"1081\", 
+#> \"local_port\":\"1081\", 
+#> \"local_address\":\"0.0.0.0\", 
+#> \"password\":\"jenga!\", 
+#> \"timeout\":60, 
+#> \"method\":\"table\" 
+#> }" > config.json.redirect
+#> echo "{ 
+#> \"server\":\"195.148.125.33\", 
+#> \"server_port\":\"1082\", 
+#> \"local_port\":\"1080\", 
+#> \"local_address\":\"0.0.0.0\", 
+#> \"password\":\"jenga!\", 
+#> \"timeout\":60, 
+#> \"method\":\"table\" 
+#> }" > config.json.redirect.Aalto
+#> echo "{ 
+#> \"server\":\"10.5.4.3\", 
+#> \"server_port\":\"1082\", 
+#> \"local_port\":\"1080\", 
+#> \"local_address\":\"0.0.0.0\", 
+#> \"password\":\"jenga!\", 
+#> \"timeout\":60, 
+#> \"method\":\"table\" 
+#> }" > config.json.server
+#> sudo sysctl -w net.ipv4.conf.all.forwarding=1 
+#> sudo sysctl -w net.ipv4.tcp_congestion_control=lia 
+#> sudo iptables -t nat -N SHADOWSOCKS  
+#> sudo iptables -t nat -A SHADOWSOCKS -d 10.5.0.0/24 -p tcp -j REDIRECT --to-ports 1081
+#> sudo iptables -t nat -A SHADOWSOCKS -d 10.5.1.0/24 -p tcp -j REDIRECT --to-ports 1080
+#> sudo iptables -t nat -A PREROUTING -s 10.5.4.0/24 -d 10.5.0.0/24 -j SHADOWSOCKS
+#> sudo iptables -t nat -A PREROUTING -s 10.5.4.0/24 -d 10.5.1.0/24 -j SHADOWSOCKS
+#>
+#> ip l a dev veth0 type veth peer name veth1
+#> ip l s dev veth0 up
+#> ip l s dev veth1 up
+#> ip a a dev veth0 195.37.154.43/24
+#> ip a a dev veth1 192.168.110.9/24
+#> ip r d 195.37.154.0/24
+#> ip r d 192.168.110.0/24
+#> ip r d local 195.37.154.43 table local
+#> ip r d local 192.168.110.9 table local
+#> ip r d broadcast 195.37.154.0 table local
+#> ip r d broadcast 192.168.110.0 table local
+#> ip r d broadcast 195.37.154.255 table local
+#> ip r d broadcast 192.168.110.255 table local
+
+
+ovs-ofctl add-flow br-cloud table=0,priority=4,in_port=6,tcp,actions=mod_vlan_vid:4,mod_dl_dst:52:54:00:12:34:59,output:9
+ovs-ofctl add-flow br-cloud table=0,priority=4,in_port=6,dl_dst=52:54:00:12:34:59,actions=mod_vlan_vid:4,output:9
+ovs-ofctl add-flow br-cloud "table=0,priority=4,in_port=6,dl_dst=ff:ff:ff:ff:ff:ff,actions=mod_vlan_vid:4,output:9,resubmit(,2)"
+ovs-ofctl add-flow br-cloud table=0,priority=4,in_port=9,dl_vlan=4,actions=strip_vlan,output:6
+ovs-ofctl add-flow br-cloud table=0,priority=4,in_port=8,tcp,actions=mod_vlan_vid:9,mod_dl_dst:52:54:00:12:34:59,output:9
+ovs-ofctl add-flow br-cloud table=0,priority=4,in_port=8,dl_dst=52:54:00:12:34:59,actions=mod_vlan_vid:9,output:9
+ovs-ofctl add-flow br-cloud "table=0,priority=4,in_port=8,dl_dst=ff:ff:ff:ff:ff:ff,actions=mod_vlan_vid:9,output:9,resubmit(,2)"
+ovs-ofctl add-flow br-cloud table=0,priority=4,in_port=9,dl_vlan=9,actions=strip_vlan,output:8
+
+#ovs-ofctl del-flows br-cloud --strict table=0,priority=4,in_port=6,tcp
+#ovs-ofctl del-flows br-cloud --strict table=0,priority=4,in_port=8,tcp
+
+
+
+## Setup in CERN for Aalto1 and NEC
+
+brctl addbr br-proxy-128
+ip l s dev br-proxy-128 up
+ip a a dev br-proxy-128 192.168.16.1/20
+ip rule add from 192.168.16.0/20 lookup 200
+ip r a 192.168.16.0/20 dev br-proxy-128  proto kernel  scope link  src 192.168.16.1 table 200
+ip r a 192.168.2.0/24 dev br-ex  proto kernel  scope link  src 192.168.2.32 table 200
+ip r a default via 192.168.2.169 table 200
+iptables -t nat -I POSTROUTING -s 192.168.16.0/20 -o br-ex -j MASQUERADE
+iptables -t nat -I PREROUTING -d 192.168.2.32 -p tcp --dport 1081 -j DNAT --to-destination 192.168.16.2
+
+ovs-vsctl add-br br-mptcp-cloud
+ovs-vsctl add-port br-mptcp-cloud mptcp-br-cloud -- set interface mptcp-br-cloud type=patch options=peer=cloud-br-mptcp
+ovs-vsctl add-port br-cloud cloud-br-mptcp -- set interface cloud-br-mptcp type=patch options=peer=mptcp-br-cloud
+
+kvm -smp 4 -m 512 -kernel bzImage-mptcp -initrd core-mptcp-tr.gz -nographic -device virtio-net,netdev=mynet -netdev tap,id=mynet,script=qemu-ifup-br-mptcp-cloud,downscript=qemu-ifdown-br-mptcp-cloud -device virtio-net,netdev=mynet2 -netdev tap,id=mynet2,script=qemu-ifup-br-proxy-128,downscript=qemu-ifdown-br-proxy-128 -append console=ttyS0
+# Run in the VM
+#> sysctl -w net.ipv4.conf.eth0.arp_accept=1
+#> sysctl -w net.ipv4.conf.eth1.arp_accept=1
+#> sysctl -w net.ipv4.conf.eth2.arp_accept=1
+#> ip l s dev eth0 address 52:54:00:12:34:62
+#> ip l s dev eth1 address 52:54:00:12:34:63
+#> ip a a dev eth0 10.5.0.249/24
+#> ip a a dev eth1 192.168.16.2/20
+#> mkdir /etc/iproute2
+#> echo "200    public-128" >> /etc/iproute2/rt_tables
+#> ip rule add from 192.168.16.2 lookup public-128
+#> ip r a 192.168.16.0/20 dev eth1  proto kernel  scope link  src 192.168.16.2 table public-128
+#> ip r a default via 192.168.16.1 table public-128
+#> ip r a default via 192.168.16.1
+#> echo "{ 
+#> \"server\":\"195.148.125.33\", 
+#> \"server_port\":\"1082\", 
+#> \"local_port\":\"1080\", 
+#> \"local_address\":\"0.0.0.0\", 
+#> \"password\":\"jenga!\", 
+#> \"timeout\":60, 
+#> \"method\":\"table\" 
+#> }" > config.json.redirect
+#> echo "{ 
+#> \"server\":\"192.168.16.2\", 
+#> \"server_port\":\"1081\", 
+#> \"local_port\":\"1080\", 
+#> \"local_address\":\"0.0.0.0\", 
+#> \"password\":\"jenga!\", 
+#> \"timeout\":60, 
+#> \"method\":\"table\" 
+#> }" > config.json.server
+#> sudo sysctl -w net.ipv4.conf.all.forwarding=1 
+#> sudo sysctl -w net.ipv4.tcp_congestion_control=lia 
+#> sudo iptables -t nat -N SHADOWSOCKS  
+#> sudo iptables -t nat -A SHADOWSOCKS -d 10.5.1.0/24 -p tcp -j REDIRECT --to-ports 1080
+#> sudo iptables -t nat -A PREROUTING -s 10.5.0.0/24 -d 10.5.1.0/24 -j SHADOWSOCKS
+#> ip l a dev veth0 type veth peer name veth1
+#> ip l s dev veth0 up
+#> ip l s dev veth1 up
+#> ip a a dev veth0 128.141.232.250/24
+#> ip r d 128.141.232.0/24
+#> ip r d local 128.141.232.250 table local
+#> ip r d broadcast 128.141.232.0 table local
+#> ip r d broadcast 128.141.232.255 table local
+
+
+ovs-ofctl add-flow br-cloud table=0,priority=4,in_port=10,tcp,actions=mod_vlan_vid:3,mod_dl_dst:52:54:00:12:34:62,output:11
+ovs-ofctl add-flow br-cloud table=0,priority=4,in_port=10,dl_dst=52:54:00:12:34:62,actions=mod_vlan_vid:3,output:11
+ovs-ofctl add-flow br-cloud "table=0,priority=4,in_port=10,dl_dst=ff:ff:ff:ff:ff:ff,actions=mod_vlan_vid:3,output:11,resubmit(,2)"
+ovs-ofctl add-flow br-cloud table=0,priority=4,in_port=11,dl_vlan=3,actions=strip_vlan,output:10
+
+
+#ovs-ofctl del-flows br-cloud --strict table=0,priority=4,in_port=10,tcp
+
+
+
+
+
+
+## Useless
+
+due to the LTE uplink on NEC side :
+ip rule :
+  0:      from all lookup local
+  216:    from 192.168.110.9 to 192.168.16.0/24 lookup 221
+  217:    from 192.168.16.0/24 lookup 221
+  218:    from 192.168.110.9 to 195.148.125.33 lookup 221
+  219:    from 192.168.110.9 lookup 200
+  220:    from all lookup 220
+  32766:  from all lookup main
+  32767:  from all lookup default
+  
+ip r show table 200:
+  default via 192.168.110.1 dev enx082e5f290e69
+  192.168.108.0/22 dev enx082e5f290e69  proto kernel  scope link  src 192.168.110.9
+ip r show table 220:
+  192.168.2.32 via 195.37.154.254 dev br-ex-public  proto static  src 195.37.154.43
+  192.168.200.14 via 195.37.154.254 dev br-ex-public  proto static  src 195.37.154.43
+ip r show table 221:
+  default via 192.168.110.1 dev enx082e5f290e69
+  192.168.16.0/24 dev br-proxy-110  proto kernel  scope link  src 192.168.16.1
+  195.148.125.33 via 192.168.110.1 dev enx082e5f290e69  proto static  src 192.168.110.9
+
+
+  
