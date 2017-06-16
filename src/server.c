@@ -994,7 +994,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         }
 
         if (!need_query) {
-            remote_t *remote = connect_to_remote(EV_A_ & info, server);
+            remote_t *remote = connect_to_remote(EV_A_ & info, server, host, ntohs(port), srchost, ntohs(srcport));
 
             if (remote == NULL) {
                 LOGE("connect error");
@@ -1154,7 +1154,7 @@ server_resolve_cb(struct sockaddr *addr, void *data)
             info.ai_addrlen = sizeof(struct sockaddr_in6);
         }
 
-        remote_t *remote = connect_to_remote(EV_A_ & info, server);
+        remote_t *remote = connect_to_remote(EV_A_ & info, server, NULL, 0, NULL, 0);
 
         if (remote == NULL) {
             close_and_free_server(EV_A_ server);
