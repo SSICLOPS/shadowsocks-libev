@@ -1,0 +1,196 @@
+#!/bin/sh
+
+# All the X need to be replaced
+
+#TODO: replace X with the internal vlan number of the network you want to use the MPTCP proxy on. This vlan tag is the segmentation ID when using vlan segmentation, but the internal vlan ID when using tunneling
+echo "#! /bin/sh
+ovs-vsctl add-port br-int $1 tag=X
+ip link set $1 up
+" > qemu-ifup
+echo "#! /bin/sh
+ovs-vsctl del-port br-int $1
+ip link set $1 down
+" > qemu-ifdown
+chmod a+x qemu-ifup
+chmod a+x qemu-ifdown
+kvm -smp 1 -m 192 -kernel bzImage-mptcp -initrd core-mptcp.gz -nographic -device virtio-net,netdev=mynet -netdev tap,id=mynet,script=qemu-ifup,downscript=qemu-ifdown -append console=ttyS0
+################################
+# Run those commands in the VM #
+################################
+#  sysctl -w net.ipv4.conf.eth0.arp_accept=1
+##TODO: This is the MPTCP proxy IP address in the network
+#  ip a a dev eth0 X.X.X.X/24
+##TODO: This is the second MPTCP proxy IP address in the network
+#  ip a a dev eth0 Y.Y.Y.Y/24
+##TODO: This is the gateway on the subnet of the first IP address
+#  ip r a default via X.X.X.X
+#  ip rule add from Y.Y.Y.Y lookup 200
+##TODO: This is the gateway on the subnet of the second IP address
+#  ip r a default via Y.Y.Y.Y table 200
+##TODO: This is the network of the 2nd IP address and the 2nd IP address
+#  ip r a Y.Y.Y.Y/24 dev eth0  proto kernel  scope link  src Y.Y.Y.Y table 200
+##TODO: this is the other end IP address
+#  echo "{ 
+#  \"server\":\"Z.Z.Z.Z\", 
+#  \"server_port\":\"1081\", 
+#  \"local_port\":\"1080\", 
+#  \"local_address\":\"0.0.0.0\", 
+#  \"password\":\"jenga!\", 
+#  \"timeout\":60, 
+#  \"method\":\"table\" 
+#  }" > config.json.redirect
+##TODO: This is the local first IP address
+#  echo "{ 
+#  \"server\":\"X.X.X.X\", 
+#  \"server_port\":\"1081\", 
+#  \"local_port\":\"1080\", 
+#  \"local_address\":\"0.0.0.0\", 
+#  \"password\":\"jenga!\", 
+#  \"timeout\":60, 
+#  \"method\":\"table\" 
+#  }" > config.json.server
+#  sudo sysctl -w net.ipv4.conf.all.forwarding=1 
+#  sudo sysctl -w net.ipv4.tcp_congestion_control=lia 
+#  sudo iptables -t nat -N SHADOWSOCKS  
+##TODO: This is the network of the first IP address, the one connected to the VM network
+#  sudo iptables -t nat -A SHADOWSOCKS -d X.X.X.X/24 -p tcp -j REDIRECT --to-ports 1080
+#  sudo iptables -t nat -A PREROUTING -s X.X.X.X/24 -d X.X.X.X/24 -j SHADOWSOCKS
+##TODO: This  is the first IP address, to avoid redirecting traffic for ourselves since we are on the same subnet
+#  sudo iptables -t nat -I PREROUTING -d X.X.X.X -j ACCEPT
+#######
+# End #
+#######
+
+#TODO: Those are the vlan tag, the network IP address and the port of the MPTCP proxy (can get with ovs-ofctl -O openflow13 show br-int), add a set_field:X->vlan_vid
+ovs-ofctl add-flow br-int table=0,priority=4,in_port=1,tcp,dl_vlan=X,nw_dst=X.X.X.X/24,actions=mod_dl_dst:52:54:00:12:34:56,output:X
+
+
+## Aalto
+
+ovs-vsctl add-br br-mptcp
+ovs-vsctl add-port br-mptcp mptcp-br-int -- set interface mptcp-br-int type=patch options=peer=int-br-mptcp
+ovs-vsctl add-port br-int int-br-mptcp -- set interface int-br-mptcp type=patch options=peer=mptcp-br-int
+echo "#! /bin/sh
+ovs-vsctl add-port br-mptcp $1
+ip link set $1 up
+" > qemu-ifup-br-int
+echo "#! /bin/sh
+ovs-vsctl del-port br-int $1
+ip link set $1 down
+" > qemu-ifdown-br-int
+kvm -smp 1 -m 192 -kernel bzImage-mptcp -initrd core-mptcp.gz -nographic -device virtio-net,netdev=mynet -netdev tap,id=mynet,script=qemu-ifup-br-int,downscript=qemu-ifdown-br-int -device virtio-net,netdev=mynet2 -netdev tap,id=mynet2,script=qemu-ifup-br-int,downscript=qemu-ifdown-br-int -append console=ttyS0
+> sysctl -w net.ipv4.conf.eth0.arp_accept=1
+> sysctl -w net.ipv4.conf.eth1.arp_accept=1
+> ip a a dev eth0 10.1.1.3/24
+> ip a a dev eth1 10.1.2.3/24
+> echo "{ 
+  \"server\":\"10.4.0.251\", 
+  \"server_port\":\"1081\", 
+  \"local_port\":\"1080\", 
+  \"local_address\":\"0.0.0.0\", 
+  \"password\":\"jenga!\", 
+  \"timeout\":60, 
+  \"method\":\"table\" 
+  }" > config.json.redirect
+> echo "{ 
+  \"server\":\"10.5.0.250\", 
+  \"server_port\":\"1081\", 
+  \"local_port\":\"1082\", 
+  \"local_address\":\"0.0.0.0\", 
+  \"password\":\"jenga!\", 
+  \"timeout\":60, 
+  \"method\":\"table\" 
+  }" > config.json.redirect.CERN
+> echo "{ 
+  \"server\":\"10.1.1.3\", 
+  \"server_port\":\"1081\", 
+  \"local_port\":\"1080\", 
+  \"local_address\":\"0.0.0.0\", 
+  \"password\":\"jenga!\", 
+  \"timeout\":60, 
+  \"method\":\"table\" 
+  }" > config.json.server
+> sudo sysctl -w net.ipv4.conf.all.forwarding=1 
+> sudo sysctl -w net.ipv4.tcp_congestion_control=lia 
+> sudo iptables -t nat -N SHADOWSOCKS  
+> sudo iptables -t nat -A SHADOWSOCKS -d 10.4.0.0/24 -p tcp -j REDIRECT --to-ports 1080
+> sudo iptables -t nat -A SHADOWSOCKS -d 10.5.0.0/16 -p tcp -j REDIRECT --to-ports 1082
+> sudo iptables -t nat -A PREROUTING -s 10.1.1.0/24 -d 10.5.0.0/16 -j SHADOWSOCKS
+> sudo iptables -t nat -A PREROUTING -s 10.1.1.0/24 -d 10.4.0.0/24 -j SHADOWSOCKS
+> ip rule add from 10.1.1.3 lookup 200
+> ip rule add from 10.1.2.3 lookup 201
+> ip r a 10.1.1.0/24 dev eth0  proto kernel  scope link  src 10.1.1.3 table 200
+> ip r a 10.1.2.0/24 dev eth1  proto kernel  scope link  src 10.1.2.3 table 201
+> ip r a default via 10.1.1.1 dev eth0 table 200
+> ip r a default via 10.1.2.1 dev eth1 table 201
+> ip r a default via 10.1.1.1
+
+
+#OR
+#./altproxy.386 -p trans+tcp -l tcp://0.0.0.0:1080 -q socks -r tcp://10.4.0.251:1081 &
+#./altproxy.386 -l tcp://0.0.0.0:1081 &
+
+
+## NEC
+
+ovs-vsctl add-br br-mptcp
+echo "#! /bin/sh
+ovs-vsctl add-port br-mptcp $1
+ip link set $1 up
+" > qemu-ifup-br-int
+echo "#! /bin/sh
+ovs-vsctl del-port br-int $1
+ip link set $1 down
+" > qemu-ifdown-br-int
+kvm -smp 1 -m 192 -kernel bzImage-mptcp -initrd core-mptcp.gz -nographic -device virtio-net,netdev=mynet -netdev tap,id=mynet,script=qemu-ifup-br-int,downscript=qemu-ifdown-br-int -device virtio-net,netdev=mynet2 -netdev tap,id=mynet2,script=qemu-ifup-br-int,downscript=qemu-ifdown-br-int -append console=ttyS0
+> sysctl -w net.ipv4.conf.eth0.arp_accept=1
+> sysctl -w net.ipv4.conf.eth1.arp_accept=1
+> ip a a dev eth0 10.4.0.251/24
+> ip a a dev eth1 10.4.1.254/24
+> echo "{ 
+  \"server\":\"10.1.1.3\", 
+  \"server_port\":\"1081\", 
+  \"local_port\":\"1080\", 
+  \"local_address\":\"0.0.0.0\", 
+  \"password\":\"jenga!\", 
+  \"timeout\":60, 
+  \"method\":\"table\" 
+  }" > config.json.redirect
+> echo "{ 
+  \"server\":\"10.4.0.251\", 
+  \"server_port\":\"1081\", 
+  \"local_port\":\"1080\", 
+  \"local_address\":\"0.0.0.0\", 
+  \"password\":\"jenga!\", 
+  \"timeout\":60, 
+  \"method\":\"table\" 
+  }" > config.json.server
+> sudo sysctl -w net.ipv4.conf.all.forwarding=1 
+> sudo sysctl -w net.ipv4.tcp_congestion_control=lia 
+> sudo iptables -t nat -N SHADOWSOCKS  
+> sudo iptables -t nat -A SHADOWSOCKS -d 10.1.1.0/24 -p tcp -j REDIRECT --to-ports 1080
+> sudo iptables -t nat -A PREROUTING -s 10.4.0.0/24 -d 10.1.1.0/24 -j SHADOWSOCKS
+
+#For Altproxy
+#> ./altproxy.386 -p trans+tcp -l tcp://0.0.0.0:1080 -q socks -r tcp://10.1.1.3:1081
+#> ./altproxy.386 -l tcp://0.0.0.0:1081
+
+
+
+
+Aalto old:
+ovs-ofctl del-flows --strict -O openflow13 br-int "priority=4,tcp,in_port=2,dl_vlan=6,nw_dst=10.4.0.0/24"
+ovs-ofctl add-flow -O openflow13 br-int "priority=4,tcp,in_port=2,dl_vlan=6,nw_dst=10.4.0.0/24 actions=set_field:52:54:00:12:34:56->eth_dst,output:48"
+Aalto new:
+ovs-ofctl del-flows --strict -O openflow13 br-int "priority=4,tcp,in_port=2,dl_vlan=10,nw_dst=10.4.0.0/24"
+ovs-ofctl del-flows --strict -O openflow13 br-int "priority=4,tcp,in_port=2,dl_vlan=10,nw_dst=10.5.0.0/16"
+ovs-ofctl add-flow -O openflow13 br-int "priority=4,tcp,in_port=2,dl_vlan=10,nw_dst=10.4.0.0/24 actions=set_field:52:54:00:12:34:56->eth_dst,output:40"
+ovs-ofctl add-flow -O openflow13 br-int "priority=4,tcp,in_port=2,dl_vlan=10,nw_dst=10.5.0.0/16 actions=set_field:52:54:00:12:34:56->eth_dst,output:40"
+NEC:
+ovs-ofctl del-flows --strict -O openflow13 br-int "priority=4,tcp,in_port=1,dl_vlan=174,nw_dst=10.1.1.0/24"
+ovs-ofctl add-flow -O openflow13 br-int "priority=4,tcp,in_port=1,dl_vlan=174,nw_dst=10.1.1.0/24 actions=set_field:4100->vlan_vid,set_field:52:54:00:12:34:56->eth_dst,output:23"
+CERN:
+ovs-ofctl del-flows --strict br-int "priority=4,tcp,in_port=2,dl_vlan=3,nw_dst=10.4.0.0/24"
+ovs-ofctl del-flows --strict br-int "priority=4,tcp,in_port=2,dl_vlan=3,nw_dst=10.1.1.0/24"
+ovs-ofctl add-flow --strict br-int "priority=4,tcp,in_port=2,dl_vlan=3,nw_dst=10.4.0.0/24 actions=set_field:62:32:85:1d:93:90->eth_dst,output:10"
+ovs-ofctl add-flow --strict br-int "priority=4,tcp,in_port=2,dl_vlan=3,nw_dst=10.1.1.0/24 actions=set_field:62:32:85:1d:93:90->eth_dst,output:10"
