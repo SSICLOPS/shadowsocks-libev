@@ -42,6 +42,11 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <sys/un.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include <libnetfilter_conntrack/libnetfilter_conntrack.h>
+#include <libnetfilter_conntrack/libnetfilter_conntrack_tcp.h>
 
 #include <libcork/core.h>
 #include <udns.h>
@@ -102,7 +107,7 @@ static void block_list_clear_cb(EV_P_ ev_timer *watcher, int revents);
 static remote_t *new_remote(int fd);
 static server_t *new_server(int fd, listen_ctx_t *listener);
 static remote_t *connect_to_remote(EV_P_ struct addrinfo *res,
-                                   server_t *server, char *destaddr, uint16_t destport, char *srcaddr, uint16_t srcport);
+                                   server_t *server, struct sockaddr *destaddr, uint16_t destport, struct sockaddr *srcaddr, uint16_t srcport);
 
 static void free_remote(remote_t *remote);
 static void close_and_free_remote(EV_P_ remote_t *remote);
@@ -110,6 +115,7 @@ static void free_server(server_t *server);
 static void close_and_free_server(EV_P_ server_t *server);
 static void server_resolve_cb(struct sockaddr *addr, void *data);
 static void query_free_cb(void *data);
+int add_snat(in_addr_t src_addr, in_addr_t dst_addr, in_addr_t orig_addr, uint16_t src_port, uint16_t dst_port, uint16_t orig_port);
 
 int verbose     = 0;
 int reuse_port = 0;
@@ -135,6 +141,7 @@ uint64_t tx                  = 0;
 uint64_t rx                  = 0;
 ev_timer stat_update_watcher;
 ev_timer block_list_watcher;
+static struct sockaddr_storage bind_src_addr;
 
 static struct ev_signal sigint_watcher;
 static struct ev_signal sigterm_watcher;
@@ -254,22 +261,12 @@ get_peer_name(int fd)
 }
 
 int
-bind_to_port(int socket_fd, int version)
+bind_to_port(int socket_fd, struct sockaddr *address)
 {
-    struct sockaddr_storage storage;
-	memset(&storage, 0, sizeof(struct sockaddr_storage));
-	if (version == 4) {
-		struct sockaddr_in *addr = (struct sockaddr_in *)&storage;
-		addr->sin_addr.s_addr = INADDR_ANY;
-		addr->sin_family = AF_INET;
-		addr->sin_port = 0;
-		return bind(socket_fd, (struct sockaddr *)addr, sizeof(struct sockaddr_in));
-	} else if (version == 6) {
-		struct sockaddr_in6 *addr = (struct sockaddr_in6 *)&storage;
-		addr->sin6_addr = in6addr_any;
-		addr->sin6_family = AF_INET6;
-		addr->sin6_port = 0;
-		return bind(socket_fd, (struct sockaddr *)addr, sizeof(struct sockaddr_in6));
+	if (address->sa_family == AF_INET) {
+		return bind(socket_fd, address, sizeof(struct sockaddr_in));
+	} else if (address->sa_family == AF_INET6) {
+		return bind(socket_fd, address, sizeof(struct sockaddr_in6));
 	}
     return -1;
 }
@@ -462,7 +459,7 @@ create_and_bind(const char *host, const char *port, int mptcp)
 
 static remote_t *
 connect_to_remote(EV_P_ struct addrinfo *res,
-                  server_t *server, char *destaddr, uint16_t destport, char *srcaddr, uint16_t srcport)
+                  server_t *server, struct sockaddr *destaddr, uint16_t destport, struct sockaddr *srcaddr, uint16_t srcport)
 {
     int sockfd;
 #ifdef SET_INTERFACE
@@ -471,7 +468,6 @@ connect_to_remote(EV_P_ struct addrinfo *res,
     socklen_t local_addr_size = sizeof(struct sockaddr_storage);
 	struct sockaddr_storage localstorage;
 	memset(&localstorage, 0, sizeof(struct sockaddr_storage));
-	char command[150] = {0};
 	int sysret = 0;
 
 
@@ -532,10 +528,10 @@ connect_to_remote(EV_P_ struct addrinfo *res,
 #endif
 
     if (((struct sockaddr_storage *)res->ai_addr)->ss_family == AF_INET){
-               bind_to_port(sockfd, 4);
+               bind_to_port(sockfd, (struct sockaddr *)&bind_src_addr);
        }
        else if (((struct sockaddr_storage *)res->ai_addr)->ss_family == AF_INET6){
-               bind_to_port(sockfd, 6);
+               bind_to_port(sockfd, (struct sockaddr *)&bind_src_addr);
        }
        getsockname(sockfd, (struct sockaddr *)&localstorage, &local_addr_size);
        if (((struct sockaddr_storage *)res->ai_addr)->ss_family == AF_INET){
@@ -543,8 +539,7 @@ connect_to_remote(EV_P_ struct addrinfo *res,
             LOGI("connect from %d", ntohs(((struct sockaddr_in *)&(localstorage))->sin_port) );
         }
 
-        sprintf(command, "/sbin/iptables -t nat -I POSTROUTING -d %s -p tcp --dport %d --sport %d -j SNAT --to %s:%d", destaddr, (int)destport, (int)ntohs(((struct sockaddr_in *)&(localstorage))->sin_port), srcaddr, (int)srcport);
-        sysret = system(command);
+        sysret = add_snat(((struct sockaddr_in *)&bind_src_addr)->sin_addr.s_addr, ((struct sockaddr_in *)destaddr)->sin_addr.s_addr, ((struct sockaddr_in *)srcaddr)->sin_addr.s_addr, ((struct sockaddr_in *)&(localstorage))->sin_port, destport, srcport);
         if ( sysret == -1) {
             ERROR("setiptables");
             close(sockfd);
@@ -554,15 +549,6 @@ connect_to_remote(EV_P_ struct addrinfo *res,
     else if (((struct sockaddr_storage *)res->ai_addr)->ss_family == AF_INET6){
         if (verbose) {
             LOGI("connect from %d", ntohs(((struct sockaddr_in6 *)&(localstorage))->sin6_port) );
-        }
-
-        sprintf(command, "/sbin/ip6tables -t nat -I POSTROUTING -d %s -p tcp --dport %d --sport %d -j SNAT --to %s:%d", destaddr, (int)destport, (int)ntohs(((struct sockaddr_in6 *)&(localstorage))->sin6_port), srcaddr, (int)srcport);
-        sysret = system(command);
-        sysret = 0;
-        if ( sysret == -1) {
-            ERROR("setip6tables");
-            close(sockfd);
-            return NULL;
         }
     }
     remote_t *remote = new_remote(sockfd);
@@ -998,8 +984,12 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         }
 
         if (!need_query) {
-            remote_t *remote = connect_to_remote(EV_A_ & info, server, host, ntohs(port), srchost, ntohs(srcport));
-
+            remote_t *remote = NULL;
+            if ((atyp & ADDRTYPE_MASK) == 5)
+                remote = connect_to_remote(EV_A_ & info, server, info.ai_addr, port, (struct sockaddr *)&srcstorage, srcport);
+            else
+                remote = connect_to_remote(EV_A_ & info, server, NULL, 0, NULL, 0);
+            
             if (remote == NULL) {
                 LOGE("connect error");
                 close_and_free_server(EV_A_ server);
@@ -1402,32 +1392,9 @@ free_remote(remote_t *remote)
 static void
 close_and_free_remote(EV_P_ remote_t *remote)
 {
-    socklen_t local_addr_size = sizeof(struct sockaddr_storage);
-    struct sockaddr_storage localstorage;
-    memset(&localstorage, 0, sizeof(struct sockaddr_storage));
-    char command[150] = {0};
-    int sysret = 0;
     if (remote != NULL) {
         ev_io_stop(EV_A_ & remote->send_ctx->io);
         ev_io_stop(EV_A_ & remote->recv_ctx->io);
-        getsockname(remote->fd, (struct sockaddr *)&localstorage, &local_addr_size);
-        if (localstorage.ss_family == AF_INET){
-            sprintf(command, "/sbin/iptables -t nat -S |    /bin/sed '/ %d/ s/^-A/-D/;t;d' |/usr/bin/xargs -L1 /sbin/iptables -t nat", (int)ntohs(((struct sockaddr_in *)&(localstorage))->sin_port));
-            sysret = system(command);
-            if ( sysret == -1) {
-                LOGI("deliptables");
-            }
-        }
-        else if (localstorage.ss_family == AF_INET6){
-            sprintf(command, "/sbin/ip6tables -t nat -S |    /bin/sed '/ %d/ s/^-A/-D/;t;d' |/usr/bin/xargs -L1 /sbin/ip6tables -t nat", (int)ntohs(((struct sockaddr_in *)&(localstorage))->sin_port));
-            sysret = system(command);
-            if ( sysret == -1) {
-                LOGI("deliptables");
-            }
-        }
-        if (verbose) {
-            LOGI("removing rule for %d", ntohs(((struct sockaddr_in *)&(localstorage))->sin_port) );
-        }
 
         close(remote->fd);
         free_remote(remote);
@@ -1612,6 +1579,57 @@ accept_cb(EV_P_ ev_io *w, int revents)
     ev_timer_start(EV_A_ & server->recv_ctx->watcher);
 }
 
+
+int add_snat(in_addr_t src_addr, in_addr_t dst_addr, in_addr_t orig_addr, uint16_t src_port, uint16_t dst_port, uint16_t orig_port)
+{
+	int ret;
+	struct nfct_handle *h;
+	struct nf_conntrack *ct;
+    
+    LOGI("SNAT rule insertion");
+    
+    if (src_addr == 0 || dst_addr == 0 || orig_addr == 0 || src_port == 0 || dst_port == 0 || orig_port == 0)
+        return 0;
+    
+	ct = nfct_new();
+	if (!ct) {
+		return -1;
+	}
+
+	nfct_set_attr_u8(ct, ATTR_L3PROTO, AF_INET);
+	nfct_set_attr_u32(ct, ATTR_IPV4_SRC, src_addr);
+	nfct_set_attr_u32(ct, ATTR_IPV4_DST, dst_addr);
+	
+	nfct_set_attr_u8(ct, ATTR_L4PROTO, IPPROTO_TCP);
+	nfct_set_attr_u16(ct, ATTR_PORT_SRC, src_port);
+	nfct_set_attr_u16(ct, ATTR_PORT_DST, dst_port);
+
+	nfct_setobjopt(ct, NFCT_SOPT_SETUP_REPLY);
+
+	nfct_set_attr_u8(ct, ATTR_TCP_STATE, TCP_CONNTRACK_SYN_SENT);
+	nfct_set_attr_u32(ct, ATTR_TIMEOUT, 100);
+
+	nfct_set_attr_u32(ct, ATTR_SNAT_IPV4, orig_addr);
+	nfct_set_attr_u16(ct, ATTR_SNAT_PORT, orig_port);
+
+	h = nfct_open(CONNTRACK, 0);
+	if (!h) {
+		nfct_destroy(ct);
+		return -1;
+	}
+
+	ret = nfct_query(h, NFCT_Q_CREATE, ct);
+
+	nfct_close(h);
+
+	nfct_destroy(ct);
+    
+    LOGI("SNAT rule added");
+
+	return ret;
+}
+
+
 int
 main(int argc, char **argv)
 {
@@ -1775,6 +1793,8 @@ main(int argc, char **argv)
             conf_path = DEFAULT_CONF_PATH;
         }
     }
+    
+    memset(&bind_src_addr, 0, sizeof(struct sockaddr_storage));
 
     if (conf_path != NULL) {
         jconf_t *conf = read_jconf(conf_path);
@@ -1832,6 +1852,10 @@ main(int argc, char **argv)
         }
         if (ipv6first == 0) {
             ipv6first = conf->ipv6_first;
+        }
+        if (bind_src_addr.ss_family == 0){
+            ((struct sockaddr_in *)&bind_src_addr)->sin_addr.s_addr = conf->src_addr;
+            bind_src_addr.ss_family = AF_INET;
         }
     }
 
@@ -1907,6 +1931,8 @@ main(int argc, char **argv)
     if (mode == UDP_ONLY) {
         LOGI("TCP relay disabled");
     }
+    
+    
 
     // ignore SIGPIPE
     signal(SIGPIPE, SIG_IGN);

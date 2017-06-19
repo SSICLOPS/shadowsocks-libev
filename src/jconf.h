@@ -19,6 +19,8 @@
  * <http://www.gnu.org/licenses/>.
  */
 
+#include <netinet/in.h>
+
 #ifndef _JCONF_H
 #define _JCONF_H
 
@@ -86,6 +88,7 @@ typedef struct {
     int mtu;
     int mptcp;
     int ipv6_first;
+    in_addr_t src_addr;
 } jconf_t;
 
 jconf_t *read_jconf(const char *file);

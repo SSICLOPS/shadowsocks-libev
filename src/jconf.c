@@ -24,6 +24,9 @@
 #include <unistd.h>
 #include <string.h>
 #include <time.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include "utils.h"
 #include "jconf.h"
@@ -148,6 +151,7 @@ jconf_t *
 read_jconf(const char *file)
 {
     static jconf_t conf;
+    struct in_addr inp;
 
     memset(&conf, 0, sizeof(jconf_t));
 
@@ -313,6 +317,10 @@ read_jconf(const char *file)
                 check_json_value_type(value, json_boolean,
                     "invalid config file: option 'ipv6_first' must be a boolean");
                 conf.ipv6_first = value->u.boolean;
+            } else if (strcmp(name, "bind_src_address") == 0) {
+                if (inet_aton(to_string(value), &inp)==0)
+                    FATAL("Invalid config file");
+                conf.src_addr = inp.s_addr;
             }
         }
     } else {

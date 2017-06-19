@@ -220,6 +220,7 @@ In general, you need the following build dependencies:
 * libudns
 * asciidoc (for documentation only)
 * xmlto (for documentation only)
+* netfilter-conntrack
 
 If your system is too old to provide libmbedtls and libsodium (later than **v1.0.8**), you will need to either install those libraries manually or upgrade your system.
 
@@ -230,7 +231,7 @@ For some of the distributions, you might install build dependencies like this:
 ```bash
 # Installation of basic build dependencies
 ## Debian / Ubuntu
-sudo apt-get install --no-install-recommends gettext build-essential autoconf libtool libpcre3-dev asciidoc xmlto libev-dev libudns-dev automake libmbedtls-dev libsodium-dev
+sudo apt-get install --no-install-recommends gettext build-essential autoconf libtool libpcre3-dev asciidoc xmlto libev-dev libudns-dev automake libmbedtls-dev libsodium-dev libnetfilter-conntrack-dev
 ## CentOS / Fedora / RHEL
 sudo yum install gettext gcc autoconf libtool automake make asciidoc xmlto udns-devel libev-devel
 ## Arch
@@ -257,7 +258,7 @@ popd
 sudo ldconfig
 
 # Start building
-./autogen.sh && ./configure && make
+./autogen.sh && env LIBS="-lnetfilter_conntrack" ./configure && make
 sudo make install
 ```
 
