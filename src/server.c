@@ -558,6 +558,7 @@ connect_to_remote(EV_P_ struct addrinfo *res,
 
         sprintf(command, "/sbin/ip6tables -t nat -I POSTROUTING -d %s -p tcp --dport %d --sport %d -j SNAT --to %s:%d", destaddr, (int)destport, (int)ntohs(((struct sockaddr_in6 *)&(localstorage))->sin6_port), srcaddr, (int)srcport);
         sysret = system(command);
+        sysret = 0;
         if ( sysret == -1) {
             ERROR("setip6tables");
             close(sockfd);
@@ -990,6 +991,8 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         if (verbose) {
             if ((atyp & ADDRTYPE_MASK) == 4)
                 LOGI("connect to [%s]:%d", host, ntohs(port));
+            else if ((atyp & ADDRTYPE_MASK) == 5 || (atyp & ADDRTYPE_MASK) == 6)
+                LOGI("connect to %s:%d from %s:%d", host, ntohs(port), srchost, ntohs(srcport));
             else
                 LOGI("connect to %s:%d", host, ntohs(port));
         }
@@ -1399,9 +1402,33 @@ free_remote(remote_t *remote)
 static void
 close_and_free_remote(EV_P_ remote_t *remote)
 {
+    socklen_t local_addr_size = sizeof(struct sockaddr_storage);
+    struct sockaddr_storage localstorage;
+    memset(&localstorage, 0, sizeof(struct sockaddr_storage));
+    char command[150] = {0};
+    int sysret = 0;
     if (remote != NULL) {
         ev_io_stop(EV_A_ & remote->send_ctx->io);
         ev_io_stop(EV_A_ & remote->recv_ctx->io);
+        getsockname(remote->fd, (struct sockaddr *)&localstorage, &local_addr_size);
+        if (localstorage.ss_family == AF_INET){
+            sprintf(command, "/sbin/iptables -t nat -S |    /bin/sed '/ %d/ s/^-A/-D/;t;d' |/usr/bin/xargs -L1 /sbin/iptables -t nat", (int)ntohs(((struct sockaddr_in *)&(localstorage))->sin_port));
+            sysret = system(command);
+            if ( sysret == -1) {
+                LOGI("deliptables");
+            }
+        }
+        else if (localstorage.ss_family == AF_INET6){
+            sprintf(command, "/sbin/ip6tables -t nat -S |    /bin/sed '/ %d/ s/^-A/-D/;t;d' |/usr/bin/xargs -L1 /sbin/ip6tables -t nat", (int)ntohs(((struct sockaddr_in *)&(localstorage))->sin_port));
+            sysret = system(command);
+            if ( sysret == -1) {
+                LOGI("deliptables");
+            }
+        }
+        if (verbose) {
+            LOGI("removing rule for %d", ntohs(((struct sockaddr_in *)&(localstorage))->sin_port) );
+        }
+
         close(remote->fd);
         free_remote(remote);
         if (verbose) {
@@ -1521,7 +1548,7 @@ signal_cb(EV_P_ ev_signal *w, int revents)
     if (revents & EV_SIGNAL) {
         switch (w->signum) {
         case SIGCHLD:
-            if (!is_plugin_running())
+            if (!is_plugin_running() && plugin != NULL)
                 LOGE("plugin service exit unexpectedly");
             else
                 return;
