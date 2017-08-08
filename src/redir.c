@@ -1116,6 +1116,9 @@ main(int argc, char **argv)
             nofile = conf->nofile;
         }
 #endif
+        if (ipv6first == 0) {
+            ipv6first = conf->ipv6_first;
+        }
 	dscp_num = conf->dscp_num;
 	dscp = conf->dscp;
     }
@@ -1173,8 +1176,8 @@ main(int argc, char **argv)
 #endif
     }
 
+    USE_SYSLOG(argv[0], pid_flags);
     if (pid_flags) {
-        USE_SYSLOG(argv[0]);
         daemonize(pid_path);
     }
 
@@ -1284,17 +1287,17 @@ main(int argc, char **argv)
         }
 
         if(listen_ctx_current->tos) {
-            LOGI("listening at %s:%s (TOS/DSCP 0x%x)", local_addr, local_port, listen_ctx_current->tos);
+            LOGI("listening at %s:%s (TOS 0x%x)", local_addr, local_port, listen_ctx_current->tos);
         } else {
             LOGI("listening at %s:%s", local_addr, local_port);
         }
 
         // Handle additionals TOS/DSCP listening ports
         if (dscp_num > 0) {
-            listen_ctx_current = (listen_ctx_t*) malloc(sizeof(listen_ctx_t));
+            listen_ctx_current = (listen_ctx_t*) ss_malloc(sizeof(listen_ctx_t));
             listen_ctx_current = memcpy(listen_ctx_current, &listen_ctx, sizeof(listen_ctx_t));
             local_port = dscp[dscp_num-1].port;
-            listen_ctx_current->tos = dscp[dscp_num-1].dscp;
+            listen_ctx_current->tos = dscp[dscp_num-1].dscp << 2;
         }
     } while (dscp_num-- > 0);
 

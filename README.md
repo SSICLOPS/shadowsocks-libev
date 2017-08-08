@@ -9,7 +9,7 @@ It is a port of [Shadowsocks](https://github.com/shadowsocks/shadowsocks)
 created by [@clowwindy](https://github.com/clowwindy), and maintained by
 [@madeye](https://github.com/madeye) and [@linusyang](https://github.com/linusyang).
 
-Current version: 3.0.6 | [Changelog](debian/changelog)
+Current version: 3.0.8 | [Changelog](debian/changelog)
 
 Travis CI: [![Travis CI](https://travis-ci.org/shadowsocks/shadowsocks-libev.svg?branch=master)](https://travis-ci.org/shadowsocks/shadowsocks-libev)
 
@@ -60,7 +60,7 @@ You have to install libsodium 1.0.8 or later before building. See [Directly buil
 
 ### Pre-build configure guide
 
-For a complete list of avaliable configure-time option,
+For a complete list of available configure-time option,
 try `configure --help`.
 
 ### Debian & Ubuntu
@@ -150,7 +150,7 @@ sudo systemctl start shadowsocks-libev      # for systemd
 
 Supported distributions:
 
-* Fedora 22, 23, 24
+* Recent Fedora versions (until EOL)
 * RHEL 6, 7 and derivatives (including CentOS, Scientific Linux)
 
 #### Build from source with centos
@@ -185,6 +185,8 @@ or `yum`:
 su -c 'yum update'
 su -c 'yum install shadowsocks-libev'
 ```
+The repository is maintained by [@librehat](https://github.com/librehat), any issues, please report [here](https://github.com/librehat/shadowsocks-libev/issues)
+
 ### Archlinux
 
 ```bash
@@ -222,6 +224,8 @@ In general, you need the following build dependencies:
 * xmlto (for documentation only)
 * netfilter-conntrack
 
+Notes: Fedora 26  libsodium version >= 1.0.12, so you can install via dnf install libsodium instead build from source.
+
 If your system is too old to provide libmbedtls and libsodium (later than **v1.0.8**), you will need to either install those libraries manually or upgrade your system.
 
 If your system provides with those libraries, you **should not** install them from source. You should jump this section and install them from distribution repository instead.
@@ -238,7 +242,7 @@ sudo yum install gettext gcc autoconf libtool automake make asciidoc xmlto udns-
 sudo pacman -S gettext gcc autoconf libtool automake make asciidoc xmlto udns libev
 
 # Installation of Libsodium
-export LIBSODIUM_VER=1.0.12
+export LIBSODIUM_VER=1.0.13
 wget https://download.libsodium.org/libsodium/releases/libsodium-$LIBSODIUM_VER.tar.gz
 tar xvf libsodium-$LIBSODIUM_VER.tar.gz
 pushd libsodium-$LIBSODIUM_VER
@@ -248,7 +252,7 @@ popd
 sudo ldconfig
 
 # Installation of MbedTLS
-export MBEDTLS_VER=2.4.2
+export MBEDTLS_VER=2.5.1
 wget https://tls.mbed.org/download/mbedtls-$MBEDTLS_VER-gpl.tgz
 tar xvf mbedtls-$MBEDTLS_VER-gpl.tgz
 pushd mbedtls-$MBEDTLS_VER

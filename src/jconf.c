@@ -321,6 +321,12 @@ read_jconf(const char *file)
                 if (inet_aton(to_string(value), &inp)==0)
                     FATAL("Invalid config file");
                 conf.src_addr = inp.s_addr;
+#ifdef HAS_SYSLOG
+            } else if (strcmp(name, "use_syslog") == 0) {
+                check_json_value_type(value, json_boolean,
+                    "invalid config file: option 'use_syslog' must be a boolean");
+                use_syslog = value->u.boolean;
+#endif
             }
         }
     } else {

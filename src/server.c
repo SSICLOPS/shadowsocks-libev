@@ -659,7 +659,7 @@ void setTosFromConnmark(remote_t* remote, server_t* server)
 			struct sockaddr_storage from_addr;
 			len = sizeof from_addr;
 			if(getpeername(remote->fd, (struct sockaddr*)&from_addr, &len) == 0) {
-				if((server->tracker = (struct dscptracker*) malloc(sizeof(struct dscptracker))))
+				if((server->tracker = (struct dscptracker*) ss_malloc(sizeof(struct dscptracker))))
 				{
 					if ((server->tracker->ct = nfct_new())) {
 						// Build conntrack query SELECT
@@ -780,11 +780,11 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         /*
          * Shadowsocks TCP Relay Header:
          *
-         *    +------+----------+----------+----------------+
-         *    | ATYP | DST.ADDR | DST.PORT |    HMAC-SHA1   |
-         *    +------+----------+----------+----------------+
-         *    |  1   | Variable |    2     |      10        |
-         *    +------+----------+----------+----------------+
+         *    +------+----------+----------+
+         *    | ATYP | DST.ADDR | DST.PORT |
+         *    +------+----------+----------+
+         *    |  1   | Variable |    2     |
+         *    +------+----------+----------+
          *
          */
 
@@ -1902,8 +1902,8 @@ main(int argc, char **argv)
     }
 #endif
 
+    USE_SYSLOG(argv[0], pid_flags);
     if (pid_flags) {
-        USE_SYSLOG(argv[0]);
         daemonize(pid_path);
     }
 
