@@ -41,6 +41,9 @@
 #include <linux/netfilter_ipv4.h>
 #include <linux/netfilter_ipv6/ip6_tables.h>
 
+#include <libnetfilter_conntrack/libnetfilter_conntrack.h>
+#include <libnetfilter_conntrack/libnetfilter_conntrack_tcp.h>
+
 #include <udns.h>
 #include <libcork/core.h>
 
@@ -85,11 +88,15 @@ static void free_remote(remote_t *remote);
 static void close_and_free_remote(EV_P_ remote_t *remote);
 static void free_server(server_t *server);
 static void close_and_free_server(EV_P_ server_t *server);
+void conntrackMarkQuery(struct sockaddr *src, struct sockaddr *dest, uint32_t *mark);
+int lookup_proxy_server_address(char *path, struct sockaddr_storage *addr);
 
 int verbose        = 0;
 int reuse_port     = 0;
 int keep_resolving = 1;
 int disable_sni    = 0;
+
+char *mark = NULL;
 
 static crypto_t *crypto = NULL;
 
@@ -471,6 +478,9 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
     remote_ctx_t *remote_send_ctx = (remote_ctx_t *)w;
     remote_t *remote              = remote_send_ctx->remote;
     server_t *server              = remote->server;
+    
+    uint32_t tmp_mark = 0;
+    socklen_t mark_size = sizeof (uint32_t);
 
     ev_timer_stop(EV_A_ & remote_send_ctx->watcher);
 
@@ -509,6 +519,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
                 memcpy(abuf->data + abuf->len, server->hostname, server->hostname_len);
                 abuf->len += server->hostname_len;
                 memcpy(abuf->data + abuf->len, &port, 2);
+                abuf->len += 2;
             } else if (AF_INET6 == server->destaddr.ss_family) { // IPv6
                 abuf->data[abuf->len++] = 6;          // Type 6 is IPv6 address, dst and source
 
@@ -528,6 +539,11 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
                 memcpy(abuf->data + abuf->len,
                        &(((struct sockaddr_in6 *)&(server->destaddr))->sin6_port),
                        2);
+                abuf->len += 2;
+                getsockopt(server->fd, SOL_SOCKET, SO_MARK, &tmp_mark, &mark_size);
+                memcpy(abuf->data + abuf->len,
+                       &tmp_mark, 4);
+                abuf->len += 4;
             } else {                             // IPv4
                 abuf->data[abuf->len++] = 5; // Type 5 is IPv4 addresses, dst and source
 
@@ -543,6 +559,11 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
                 abuf->len += 2;
                 memcpy(abuf->data + abuf->len,
                        &((struct sockaddr_in *)&(server->destaddr))->sin_port, 2);
+                                abuf->len += 2;
+                getsockopt(server->fd, SOL_SOCKET, SO_MARK, &tmp_mark, &mark_size);
+                memcpy(abuf->data + abuf->len,
+                       &tmp_mark, 4);
+                abuf->len += 4;
             }
 
             abuf->len += 2;
@@ -787,6 +808,12 @@ accept_cb(EV_P_ ev_io *w, int revents)
     memset(&destaddr, 0, sizeof(struct sockaddr_storage));
     memset(&srcaddr, 0, sizeof(struct sockaddr_storage));
 
+    char *ptr = NULL;
+    uint32_t tmp_mark = 0;
+    
+    if (mark != NULL) 
+        tmp_mark = (uint32_t) strtoul(mark, &ptr, 16);
+    
     int err;
 
     int serverfd = accept(listener->fd, NULL, NULL);
@@ -813,6 +840,33 @@ accept_cb(EV_P_ ev_io *w, int revents)
 #ifdef SO_NOSIGPIPE
     setsockopt(serverfd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
 #endif
+
+    if (tmp_mark == 0)
+    {
+        if (mark == NULL)
+            mark = malloc(11);
+        memset(mark, 0, 11);
+        
+        conntrackMarkQuery((struct sockaddr *) &srcaddr, (struct sockaddr *) &destaddr, &tmp_mark);
+        if (tmp_mark != 0)
+        {
+            snprintf(mark,11,"0x%x",(unsigned int)tmp_mark);
+        }
+    }
+    if (tmp_mark != 0)
+    {
+        LOGI("%u",(unsigned int)tmp_mark);
+        setsockopt (serverfd, SOL_SOCKET, SO_MARK, &tmp_mark, sizeof (uint32_t));
+    } 
+    else
+    {
+        if(mark != NULL)
+        {
+            free(mark);
+            mark = NULL;
+        }
+    }
+
 
     int index                    = rand() % listener->remote_num;
     struct sockaddr *remote_addr = listener->remote_addr[index];
@@ -917,6 +971,72 @@ signal_cb(EV_P_ ev_signal *w, int revents)
     }
 }
 
+
+int getMarkCallback(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, void *data)
+{
+	uint32_t *mark_tmp = (uint32_t *) data;
+    *mark_tmp = nfct_get_attr_u32(ct, ATTR_MARK);
+	return NFCT_CB_CONTINUE;
+}
+
+void conntrackMarkQuery(struct sockaddr *src, struct sockaddr *dest, uint32_t *mark) 
+{
+	struct nfct_handle *h = nfct_open(CONNTRACK, 0);
+    struct nf_conntrack *ct;
+    
+    if ((ct = nfct_new())) 
+    {
+        // Build conntrack query SELECT
+        if (src->sa_family == AF_INET) 
+        {
+            struct sockaddr_in *src_in = (struct sockaddr_in *)src;
+            struct sockaddr_in *dst_in = (struct sockaddr_in *)dest;
+
+            nfct_set_attr_u8(ct, ATTR_L3PROTO, AF_INET);
+            nfct_set_attr_u32(ct, ATTR_IPV4_DST, dst_in->sin_addr.s_addr);
+            nfct_set_attr_u32(ct, ATTR_IPV4_SRC, src_in->sin_addr.s_addr);
+            nfct_set_attr_u16(ct, ATTR_PORT_DST, dst_in->sin_port);
+            nfct_set_attr_u16(ct, ATTR_PORT_SRC, src_in->sin_port);
+        } else if (src->sa_family == AF_INET6) 
+        {
+            struct sockaddr_in6 *src_in6 = (struct sockaddr_in6 *)&src;
+            struct sockaddr_in6 *dst_in6 = (struct sockaddr_in6 *)&dest;
+
+            nfct_set_attr_u8(ct, ATTR_L3PROTO, AF_INET6);
+            nfct_set_attr(ct, ATTR_IPV6_DST, dst_in6->sin6_addr.s6_addr);
+            nfct_set_attr(ct, ATTR_IPV6_SRC, src_in6->sin6_addr.s6_addr);
+            nfct_set_attr_u16(ct, ATTR_PORT_DST, dst_in6->sin6_port);
+            nfct_set_attr_u16(ct, ATTR_PORT_SRC, src_in6->sin6_port);
+        } else
+        {
+            LOGE("WTF error");
+        }
+        nfct_set_attr_u8(ct, ATTR_L4PROTO, IPPROTO_TCP);
+        
+    
+        if (h) {
+            nfct_callback_register(h, NFCT_T_ALL, getMarkCallback, mark);
+            int x = nfct_query(h, NFCT_Q_GET, ct);
+            if (x == -1) {
+                if(errno != ENOENT)
+                    LOGE("Connmark: Failed to retrieve connection mark %s", strerror(errno));
+                else
+                    LOGI("Connection not found in Conntrack");
+            }
+            nfct_close(h);
+        } else {
+            LOGE("Connmark: Failed to open conntrack handle for upstream netfilter mark retrieval.");
+        }
+        nfct_destroy(ct);
+    
+    } else 
+    {
+        LOGE("Failed to allocate new conntrack for upstream netfilter mark retrieval.");
+        ct=NULL;
+    }
+    
+}
+
 int
 main(int argc, char **argv)
 {
@@ -966,7 +1086,7 @@ main(int argc, char **argv)
 
     USE_TTY();
 
-    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:c:b:a:n:huUv6A",
+    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:c:b:a:n:M:huUv6A",
                             long_options, NULL)) != -1) {
         switch (c) {
         case GETOPT_VAL_FAST_OPEN:
@@ -1050,6 +1170,11 @@ main(int argc, char **argv)
             break;
         case 'A':
             FATAL("One time auth has been deprecated. Try AEAD ciphers instead.");
+            break;
+        case 'M':
+            mark = malloc(strlen(optarg)+1);
+            memset(mark, 0, strlen(optarg)+1);
+            strncpy(mark, optarg, strlen(optarg));
             break;
         case '?':
             // The option character is not recognized.
@@ -1332,6 +1457,9 @@ main(int argc, char **argv)
     if (plugin != NULL) {
         stop_plugin();
     }
+    
+    if (mark != NULL)
+        free(mark);
 
     return 0;
 }

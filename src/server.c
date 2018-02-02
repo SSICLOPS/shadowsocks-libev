@@ -107,7 +107,7 @@ static void block_list_clear_cb(EV_P_ ev_timer *watcher, int revents);
 static remote_t *new_remote(int fd);
 static server_t *new_server(int fd, listen_ctx_t *listener);
 static remote_t *connect_to_remote(EV_P_ struct addrinfo *res,
-                                   server_t *server, struct sockaddr *destaddr, uint16_t destport, struct sockaddr *srcaddr, uint16_t srcport);
+                                   server_t *server, struct sockaddr *destaddr, uint16_t destport, struct sockaddr *srcaddr, uint16_t srcport, uint32_t mark);
 
 static void free_remote(remote_t *remote);
 static void close_and_free_remote(EV_P_ remote_t *remote);
@@ -115,7 +115,7 @@ static void free_server(server_t *server);
 static void close_and_free_server(EV_P_ server_t *server);
 static void server_resolve_cb(struct sockaddr *addr, void *data);
 static void query_free_cb(void *data);
-int add_snat(in_addr_t src_addr, in_addr_t dst_addr, in_addr_t orig_addr, uint16_t src_port, uint16_t dst_port, uint16_t orig_port);
+int add_snat(in_addr_t src_addr, in_addr_t dst_addr, in_addr_t orig_addr, uint16_t src_port, uint16_t dst_port, uint16_t orig_port, uint32_t mark);
 
 int verbose     = 0;
 int reuse_port = 0;
@@ -142,6 +142,8 @@ uint64_t rx                  = 0;
 ev_timer stat_update_watcher;
 ev_timer block_list_watcher;
 static struct sockaddr_storage bind_src_addr;
+
+uint32_t mark = 0;
 
 static struct ev_signal sigint_watcher;
 static struct ev_signal sigterm_watcher;
@@ -459,7 +461,7 @@ create_and_bind(const char *host, const char *port, int mptcp)
 
 static remote_t *
 connect_to_remote(EV_P_ struct addrinfo *res,
-                  server_t *server, struct sockaddr *destaddr, uint16_t destport, struct sockaddr *srcaddr, uint16_t srcport)
+                  server_t *server, struct sockaddr *destaddr, uint16_t destport, struct sockaddr *srcaddr, uint16_t srcport, uint32_t mark)
 {
     int sockfd;
 #ifdef SET_INTERFACE
@@ -504,6 +506,16 @@ connect_to_remote(EV_P_ struct addrinfo *res,
     setsockopt(sockfd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
 #endif
     setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    if (mark != 0)
+    {
+        if (setsockopt (sockfd, SOL_SOCKET, SO_MARK, &mark, sizeof (uint32_t)) < 0)
+        {
+            ERROR("setmark");
+            close(sockfd);
+            return NULL;
+        }
+    }
 
     // setup remote socks
 
@@ -539,7 +551,7 @@ connect_to_remote(EV_P_ struct addrinfo *res,
             LOGI("connect from %d", ntohs(((struct sockaddr_in *)&(localstorage))->sin_port) );
         }
 
-        sysret = add_snat(((struct sockaddr_in *)&bind_src_addr)->sin_addr.s_addr, ((struct sockaddr_in *)destaddr)->sin_addr.s_addr, ((struct sockaddr_in *)srcaddr)->sin_addr.s_addr, ((struct sockaddr_in *)&(localstorage))->sin_port, destport, srcport);
+        sysret = add_snat(((struct sockaddr_in *)&bind_src_addr)->sin_addr.s_addr, ((struct sockaddr_in *)destaddr)->sin_addr.s_addr, ((struct sockaddr_in *)srcaddr)->sin_addr.s_addr, ((struct sockaddr_in *)&(localstorage))->sin_port, destport, srcport, mark);
         if ( sysret == -1) {
             ERROR("setiptables");
             close(sockfd);
@@ -798,6 +810,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         char srchost[257] = { 0 };
         uint16_t port  = 0;
         uint16_t srcport = 0;
+        uint32_t tmp_mark = 0;
         struct addrinfo info;
         struct sockaddr_storage storage;
         struct sockaddr_storage srcstorage;
@@ -824,6 +837,8 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                 return;
             }
             addr->sin_port   = *(uint16_t *)(server->buf->data + offset);
+            port = (*(uint16_t *)(server->buf->data + offset));
+            offset += 2;
             info.ai_family   = AF_INET;
             info.ai_socktype = SOCK_STREAM;
             info.ai_protocol = IPPROTO_TCP;
@@ -836,7 +851,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             addr->sin_family = AF_INET;
             struct sockaddr_in *srcaddr = (struct sockaddr_in *)&srcstorage;
             srcaddr->sin_family = AF_INET;
-            if (server->buf->len >= 2*in_addr_len + 3) {
+            if (server->buf->len >= 2*in_addr_len + 7) {
                 addr->sin_addr = *(struct in_addr *)(server->buf->data + offset);
                 dns_ntop(AF_INET, (const void *)(server->buf->data + offset),
                          host, INET_ADDRSTRLEN);
@@ -847,12 +862,16 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                 offset += in_addr_len;
                 srcport = *(uint16_t *)(server->buf->data + offset);
                 offset += 2;
+                addr->sin_port   = *(uint16_t *)(server->buf->data + offset);
+                port = (*(uint16_t *)(server->buf->data + offset));
+                offset += 2;
+                tmp_mark = *(uint32_t *)(server->buf->data + offset);
+                offset += 4;
             } else {
                 report_addr(server->fd, MALFORMED, "invalid length for ipv4 address");
                 close_and_free_server(EV_A_ server);
                 return;
             }
-            addr->sin_port   = *(uint16_t *)(server->buf->data + offset);
             info.ai_family   = AF_INET;
             info.ai_socktype = SOCK_STREAM;
             info.ai_protocol = IPPROTO_TCP;
@@ -904,6 +923,8 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                 }
                 need_query = 1;
             }
+            port = (*(uint16_t *)(server->buf->data + offset));
+            offset += 2;
         } else if ((atyp & ADDRTYPE_MASK) == 4) {
             // IP V6
             struct sockaddr_in6 *addr = (struct sockaddr_in6 *)&storage;
@@ -921,6 +942,8 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                 return;
             }
             addr->sin6_port  = *(uint16_t *)(server->buf->data + offset);
+            port = (*(uint16_t *)(server->buf->data + offset));
+            offset += 2;
             info.ai_family   = AF_INET6;
             info.ai_socktype = SOCK_STREAM;
             info.ai_protocol = IPPROTO_TCP;
@@ -933,7 +956,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             addr->sin6_family = AF_INET6;
             struct sockaddr_in6 *srcaddr = (struct sockaddr_in6 *)&srcstorage;
             srcaddr->sin6_family = AF_INET6;
-            if (server->buf->len >= 2*in6_addr_len + 5) {
+            if (server->buf->len >= 2*in6_addr_len + 7) {
                 addr->sin6_addr = *(struct in6_addr *)(server->buf->data + offset);
                 dns_ntop(AF_INET6, (const void *)(server->buf->data + offset),
                          host, INET6_ADDRSTRLEN);
@@ -944,13 +967,18 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                 offset += in6_addr_len;
                 srcport = *(uint16_t *)(server->buf->data + offset);
                                offset += 2;
+                offset += 2;
+                addr->sin6_port  = *(uint16_t *)(server->buf->data + offset);
+                port = (*(uint16_t *)(server->buf->data + offset));
+                offset += 2;
+                tmp_mark = *(uint32_t *)(server->buf->data + offset);
+                offset += 4;
             } else {
                 LOGE("invalid header with addr type %d", atyp);
                 report_addr(server->fd, MALFORMED, "invalid length for ipv6 address");
                 close_and_free_server(EV_A_ server);
                 return;
             }
-            addr->sin6_port  = *(uint16_t *)(server->buf->data + offset);
             info.ai_family   = AF_INET6;
             info.ai_socktype = SOCK_STREAM;
             info.ai_protocol = IPPROTO_TCP;
@@ -963,10 +991,6 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             close_and_free_server(EV_A_ server);
             return;
         }
-
-        port = (*(uint16_t *)(server->buf->data + offset));
-
-        offset += 2;
 
         if (server->buf->len < offset) {
             report_addr(server->fd, MALFORMED, "invalid request length");
@@ -985,19 +1009,23 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             else
                 LOGI("connect to %s:%d", host, ntohs(port));
         }
-
+        
+        if (tmp_mark == 0 && mark != 0)
+            tmp_mark = mark;
+        
         if (!need_query) {
             remote_t *remote = NULL;
             if ((atyp & ADDRTYPE_MASK) == 5)
-                remote = connect_to_remote(EV_A_ & info, server, info.ai_addr, port, (struct sockaddr *)&srcstorage, srcport);
+                remote = connect_to_remote(EV_A_ & info, server, info.ai_addr, port, (struct sockaddr *)&srcstorage, srcport, tmp_mark);
             else
-                remote = connect_to_remote(EV_A_ & info, server, NULL, 0, NULL, 0);
+                remote = connect_to_remote(EV_A_ & info, server, NULL, 0, NULL, 0, 0);
             
             if (remote == NULL) {
                 LOGE("connect error");
                 close_and_free_server(EV_A_ server);
                 return;
             } else {
+                
                 server->remote = remote;
                 remote->server = server;
 
@@ -1151,7 +1179,7 @@ server_resolve_cb(struct sockaddr *addr, void *data)
             info.ai_addrlen = sizeof(struct sockaddr_in6);
         }
 
-        remote_t *remote = connect_to_remote(EV_A_ & info, server, NULL, 0, NULL, 0);
+        remote_t *remote = connect_to_remote(EV_A_ & info, server, NULL, 0, NULL, 0, 0);
 
         if (remote == NULL) {
             close_and_free_server(EV_A_ server);
@@ -1591,7 +1619,7 @@ accept_cb(EV_P_ ev_io *w, int revents)
 }
 
 
-int add_snat(in_addr_t src_addr, in_addr_t dst_addr, in_addr_t orig_addr, uint16_t src_port, uint16_t dst_port, uint16_t orig_port)
+int add_snat(in_addr_t src_addr, in_addr_t dst_addr, in_addr_t orig_addr, uint16_t src_port, uint16_t dst_port, uint16_t orig_port, uint32_t mark)
 {
 	int ret;
 	struct nfct_handle *h;
@@ -1614,6 +1642,7 @@ int add_snat(in_addr_t src_addr, in_addr_t dst_addr, in_addr_t orig_addr, uint16
 	nfct_set_attr_u8(ct, ATTR_L4PROTO, IPPROTO_TCP);
 	nfct_set_attr_u16(ct, ATTR_PORT_SRC, src_port);
 	nfct_set_attr_u16(ct, ATTR_PORT_DST, dst_port);
+    nfct_set_attr_u32(ct, ATTR_MARK, mark);
 
 	nfct_setobjopt(ct, NFCT_SOPT_SETUP_REPLY);
 
@@ -1656,6 +1685,7 @@ main(int argc, char **argv)
     char *pid_path  = NULL;
     char *conf_path = NULL;
     char *iface     = NULL;
+    char *ptr       = NULL;
 
     char *server_port = NULL;
     char *plugin_opts = NULL;
@@ -1690,7 +1720,7 @@ main(int argc, char **argv)
 
     USE_TTY();
 
-    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:b:c:i:d:a:n:huUv6A",
+    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:b:c:i:d:a:n:M:huUv6A",
                             long_options, NULL)) != -1) {
         switch (c) {
         case GETOPT_VAL_FAST_OPEN:
@@ -1786,6 +1816,9 @@ main(int argc, char **argv)
         case 'A':
             FATAL("One time auth has been deprecated. Try AEAD ciphers instead.");
             break;
+        case 'M':
+            mark = (uint32_t) strtoul(optarg, &ptr, 10);
+            break;
         case '?':
             // The option character is not recognized.
             LOGE("Unrecognized option: %s", optarg);
@@ -1794,6 +1827,8 @@ main(int argc, char **argv)
         }
     }
 
+    
+    
     if (opterr) {
         usage();
         exit(EXIT_FAILURE);
@@ -1807,6 +1842,7 @@ main(int argc, char **argv)
     
     memset(&bind_src_addr, 0, sizeof(struct sockaddr_storage));
 
+    
     if (conf_path != NULL) {
         jconf_t *conf = read_jconf(conf_path);
         if (server_num == 0) {
@@ -1879,6 +1915,7 @@ main(int argc, char **argv)
         usage();
         exit(EXIT_FAILURE);
     }
+    
 
     remote_port = server_port;
 
