@@ -91,7 +91,7 @@ int reuse_port     = 0;
 int keep_resolving = 1;
 int disable_sni    = 0;
 
-static crypto_t *crypto;
+static crypto_t *crypto = NULL;
 
 static int ipv6first = 0;
 static int mode      = TCP_ONLY;
@@ -278,13 +278,16 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         return;
     }
 
-    int err = crypto->encrypt(remote->buf, server->e_ctx, BUF_SIZE);
+    if (crypto != NULL)
+    {
+        int err = crypto->encrypt(remote->buf, server->e_ctx, BUF_SIZE);
 
-    if (err) {
-        LOGE("invalid password or cipher");
-        close_and_free_remote(EV_A_ remote);
-        close_and_free_server(EV_A_ server);
-        return;
+        if (err) {
+            LOGE("invalid password or cipher");
+            close_and_free_remote(EV_A_ remote);
+            close_and_free_server(EV_A_ server);
+            return;
+        }
     }
 
     int s = send(remote->fd, remote->buf->data, remote->buf->len, 0);
@@ -419,14 +422,17 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
 
     server->buf->len = r;
 
-    int err = crypto->decrypt(server->buf, server->d_ctx, BUF_SIZE);
-    if (err == CRYPTO_ERROR) {
-        LOGE("invalid password or cipher");
-        close_and_free_remote(EV_A_ remote);
-        close_and_free_server(EV_A_ server);
-        return;
-    } else if (err == CRYPTO_NEED_MORE) {
-        return; // Wait for more
+    if (crypto != NULL)
+    {
+        int err = crypto->decrypt(server->buf, server->d_ctx, BUF_SIZE);
+        if (err == CRYPTO_ERROR) {
+            LOGE("invalid password or cipher");
+            close_and_free_remote(EV_A_ remote);
+            close_and_free_server(EV_A_ server);
+            return;
+        } else if (err == CRYPTO_NEED_MORE) {
+            return; // Wait for more
+        }
     }
 
     int s = send(server->fd, server->buf->data, server->buf->len, 0);
@@ -541,22 +547,25 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
 
             abuf->len += 2;
 
-            int err = crypto->encrypt(abuf, server->e_ctx, BUF_SIZE);
-            if (err) {
-                LOGE("invalid password or cipher");
-                bfree(abuf);
-                close_and_free_remote(EV_A_ remote);
-                close_and_free_server(EV_A_ server);
-                return;
-            }
+            if (crypto != NULL)
+            {
+                int err = crypto->encrypt(abuf, server->e_ctx, BUF_SIZE);
+                if (err) {
+                    LOGE("invalid password or cipher");
+                    bfree(abuf);
+                    close_and_free_remote(EV_A_ remote);
+                    close_and_free_server(EV_A_ server);
+                    return;
+                }
 
-            err = crypto->encrypt(remote->buf, server->e_ctx, BUF_SIZE);
-            if (err) {
-                LOGE("invalid password or cipher");
-                bfree(abuf);
-                close_and_free_remote(EV_A_ remote);
-                close_and_free_server(EV_A_ server);
-                return;
+                err = crypto->encrypt(remote->buf, server->e_ctx, BUF_SIZE);
+                if (err) {
+                    LOGE("invalid password or cipher");
+                    bfree(abuf);
+                    close_and_free_remote(EV_A_ remote);
+                    close_and_free_server(EV_A_ server);
+                    return;
+                }
             }
 
             bprepend(remote->buf, abuf, BUF_SIZE);
@@ -714,8 +723,11 @@ new_server(int fd)
 
     server->e_ctx = ss_align(sizeof(cipher_ctx_t));
     server->d_ctx = ss_align(sizeof(cipher_ctx_t));
-    crypto->ctx_init(crypto->cipher, server->e_ctx, 1);
-    crypto->ctx_init(crypto->cipher, server->d_ctx, 0);
+    if (crypto != NULL)
+    {
+        crypto->ctx_init(crypto->cipher, server->e_ctx, 1);
+        crypto->ctx_init(crypto->cipher, server->d_ctx, 0);
+    }
 
     ev_io_init(&server->recv_ctx->io, server_recv_cb, fd, EV_READ);
     ev_io_init(&server->send_ctx->io, server_send_cb, fd, EV_WRITE);
@@ -736,11 +748,13 @@ free_server(server_t *server)
         server->remote->server = NULL;
     }
     if (server->e_ctx != NULL) {
-        crypto->ctx_release(server->e_ctx);
+        if (crypto != NULL)
+            crypto->ctx_release(server->e_ctx);
         ss_free(server->e_ctx);
     }
     if (server->d_ctx != NULL) {
-        crypto->ctx_release(server->d_ctx);
+        if (crypto != NULL)
+            crypto->ctx_release(server->d_ctx);
         ss_free(server->d_ctx);
     }
     if (server->buf != NULL) {
@@ -1141,9 +1155,9 @@ main(int argc, char **argv)
         LOGI("plugin \"%s\" enabled", plugin);
     }
 
-    if (method == NULL) {
+    /*if (method == NULL) {
         method = "rc4-md5";
-    }
+    }*/
 
     if (timeout == NULL) {
         timeout = "600";
@@ -1214,10 +1228,13 @@ main(int argc, char **argv)
     ev_signal_start(EV_DEFAULT, &sigchld_watcher);
 
     // Setup keys
-    LOGI("initializing ciphers... %s", method);
-    crypto = crypto_init(password, key, method);
-    if (crypto == NULL)
-        FATAL("failed to initialize ciphers");
+    if (method != NULL)
+    {
+        LOGI("initializing ciphers... %s", method);
+        crypto = crypto_init(password, key, method);
+        if (crypto == NULL)
+            FATAL("failed to initialize ciphers");
+    }
 
     // Setup proxy context
     struct listen_ctx listen_ctx;

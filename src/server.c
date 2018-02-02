@@ -120,7 +120,7 @@ int add_snat(in_addr_t src_addr, in_addr_t dst_addr, in_addr_t orig_addr, uint16
 int verbose     = 0;
 int reuse_port = 0;
 
-static crypto_t *crypto;
+static crypto_t *crypto = NULL;
 
 static int acl       = 0;
 static int mode      = TCP_ONLY;
@@ -737,22 +737,25 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
     tx += r;
     buf->len = r;
 
-    int err = crypto->decrypt(buf, server->d_ctx, BUF_SIZE);
+    if (crypto!=NULL)
+    {
+        int err = crypto->decrypt(buf, server->d_ctx, BUF_SIZE);
 
-    if (err == CRYPTO_ERROR) {
-        report_addr(server->fd, MALICIOUS, "authentication error");
-        close_and_free_remote(EV_A_ remote);
-        close_and_free_server(EV_A_ server);
-        return;
-    } else if (err == CRYPTO_NEED_MORE) {
-        if (server->stage != STAGE_STREAM && server->frag > MAX_FRAG) {
-            report_addr(server->fd, MALICIOUS, "malicious fragmentation");
+        if (err == CRYPTO_ERROR) {
+            report_addr(server->fd, MALICIOUS, "authentication error");
             close_and_free_remote(EV_A_ remote);
             close_and_free_server(EV_A_ server);
             return;
+        } else if (err == CRYPTO_NEED_MORE) {
+            if (server->stage != STAGE_STREAM && server->frag > MAX_FRAG) {
+                report_addr(server->fd, MALICIOUS, "malicious fragmentation");
+                close_and_free_remote(EV_A_ remote);
+                close_and_free_server(EV_A_ server);
+                return;
+            }
+            server->frag++;
+            return;
         }
-        server->frag++;
-        return;
     }
 
     // handshake and transmit data
@@ -1214,13 +1217,16 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     rx += r;
 
     server->buf->len = r;
-    int err = crypto->encrypt(server->buf, server->e_ctx, BUF_SIZE);
+    if (crypto!=NULL)
+    {
+        int err = crypto->encrypt(server->buf, server->e_ctx, BUF_SIZE);
 
-    if (err) {
-        LOGE("invalid password or cipher");
-        close_and_free_remote(EV_A_ remote);
-        close_and_free_server(EV_A_ server);
-        return;
+        if (err) {
+            LOGE("invalid password or cipher");
+            close_and_free_remote(EV_A_ remote);
+            close_and_free_server(EV_A_ server);
+            return;
+        }
     }
 
 #ifdef USE_NFCONNTRACK_TOS
@@ -1436,8 +1442,11 @@ new_server(int fd, listen_ctx_t *listener)
 
     server->e_ctx = ss_align(sizeof(cipher_ctx_t));
     server->d_ctx = ss_align(sizeof(cipher_ctx_t));
-    crypto->ctx_init(crypto->cipher, server->e_ctx, 1);
-    crypto->ctx_init(crypto->cipher, server->d_ctx, 0);
+    if (crypto != NULL)
+    {
+        crypto->ctx_init(crypto->cipher, server->e_ctx, 1);
+        crypto->ctx_init(crypto->cipher, server->d_ctx, 0);
+    }
 
     int request_timeout = min(MAX_REQUEST_TIMEOUT, listener->timeout)
                           + rand() % MAX_REQUEST_TIMEOUT;
@@ -1472,11 +1481,13 @@ free_server(server_t *server)
         server->remote->server = NULL;
     }
     if (server->e_ctx != NULL) {
-        crypto->ctx_release(server->e_ctx);
+        if (crypto != NULL)
+            crypto->ctx_release(server->e_ctx);
         ss_free(server->e_ctx);
     }
     if (server->d_ctx != NULL) {
-        crypto->ctx_release(server->d_ctx);
+        if (crypto != NULL)
+            crypto->ctx_release(server->d_ctx);
         ss_free(server->d_ctx);
     }
     if (server->buf != NULL) {
@@ -1881,9 +1892,9 @@ main(int argc, char **argv)
         server_port = tmp_port;
     }
 
-    if (method == NULL) {
+    /*if (method == NULL) {
         method = "rc4-md5";
-    }
+    }*/
 
     if (timeout == NULL) {
         timeout = "60";
@@ -1946,10 +1957,13 @@ main(int argc, char **argv)
     ev_signal_start(EV_DEFAULT, &sigchld_watcher);
 
     // setup keys
-    LOGI("initializing ciphers... %s", method);
-    crypto = crypto_init(password, key, method);
-    if (crypto == NULL)
-        FATAL("failed to initialize ciphers");
+    if (method != NULL)
+    {
+        LOGI("initializing ciphers... %s", method);
+        crypto = crypto_init(password, key, method);
+        if (crypto == NULL)
+            FATAL("failed to initialize ciphers");
+    }
 
     // initialize ev loop
     struct ev_loop *loop = EV_DEFAULT;
